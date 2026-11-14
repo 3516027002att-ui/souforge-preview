@@ -1,0 +1,193 @@
+import { access, constants, realpath, stat } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { makeWorkspaceId } from './resourceUri.js';
+import { isPathInside, pathsEqual, verifyPathInsideRoot } from './pathBoundary.js';
+import { EMEVD_EXTERNAL_SCHEMA_FORBIDDEN_CODE } from '../emevd/emedfRegistryResolver.js';
+/**
+ * Workspace session: the opened Mod workspace (overlay) is writable.
+ * Overlay may sit inside a mounted game install (e.g. Sekiro\\mods); those
+ * opened paths stay writable. Sibling files that are only in the mounted game
+ * tree and not in the opened workspace stay rejected.
+ *
+ * The paths exposed through `layers` stay in the namespace selected by the
+ * caller. This matters on Windows, where `realpath()` may expand an 8.3 alias
+ * such as RUNNER~1 into a long path and make a valid caller-built child path
+ * appear lexically unrelated. Physical paths are retained separately for
+ * identity, alias detection and the authoritative reparse-point write gate.
+ */
+export async function openWorkspaceSession(options) {
+    assertNoExternalEmedfOptions(options);
+    const overlayRoot = resolve(options.overlayRoot);
+    await assertDirectory(overlayRoot, 'overlayRoot');
+    const physicalOverlayRoot = await realpath(overlayRoot);
+    let baseRoot;
+    let physicalBaseRoot;
+    if (options.baseRoot) {
+        baseRoot = resolve(options.baseRoot);
+        await assertDirectory(baseRoot, 'baseRoot');
+        physicalBaseRoot = await realpath(baseRoot);
+        if (pathsEqual(physicalOverlayRoot, physicalBaseRoot)) {
+            throw new Error('baseRoot must not be the same directory as overlayRoot.');
+        }
+    }
+    // Staging roots are optional and may be created later by Patch Engine.
+    const stagingRoot = options.stagingRoot ? resolve(options.stagingRoot) : undefined;
+    const layers = {
+        overlayRoot,
+        ...(baseRoot ? { baseRoot } : {}),
+        ...(stagingRoot ? { stagingRoot } : {})
+    };
+    const meta = {
+        // Preserve one identity for aliases that resolve to the same physical root.
+        workspaceId: makeWorkspaceId(physicalOverlayRoot),
+        layers,
+        game: options.game ?? 'unknown',
+        openedAt: new Date().toISOString(),
+        baseMissing: !baseRoot
+    };
+    const session = {
+        meta,
+        layers,
+        isOverlayPath(absolutePath) {
+            return isInsideSelectedOrPhysicalRoot(overlayRoot, physicalOverlayRoot, absolutePath);
+        },
+        isBasePath(absolutePath) {
+            // Opened overlay wins. A mods folder inside the game tree is overlay, not base.
+            if (isInsideSelectedOrPhysicalRoot(overlayRoot, physicalOverlayRoot, absolutePath)) {
+                return false;
+            }
+            return baseRoot && physicalBaseRoot
+                ? isInsideSelectedOrPhysicalRoot(baseRoot, physicalBaseRoot, absolutePath)
+                : false;
+        },
+        resolveWritablePath(absolutePath, layer = 'overlay') {
+            const diagnostics = [];
+            const resolved = resolve(absolutePath);
+            const insideOpenedWorkspace = isInsideSelectedOrPhysicalRoot(overlayRoot, physicalOverlayRoot, resolved);
+            if (layer === 'staging') {
+                if (stagingRoot && isPathInside(stagingRoot, resolved)) {
+                    return { ok: true, absolutePath: resolved, layer, diagnostics };
+                }
+                diagnostics.push({
+                    severity: 'error',
+                    code: stagingRoot ? 'WRITE_OUTSIDE_STAGING' : 'STAGING_ROOT_NOT_CONFIGURED',
+                    message: stagingRoot
+                        ? '暂存写入必须位于当前会话的暂存根目录内。'
+                        : '当前工作区会话没有配置暂存根目录。',
+                    details: { absolutePath: resolved, stagingRoot }
+                });
+                return { ok: false, layer, diagnostics };
+            }
+            // Opened workspace first. Nested mods (Sekiro\\mods) used to match the
+            // mounted game tree and get WRITE_TO_BASE_FORBIDDEN even though the user
+            // opened the mods folder.
+            if (insideOpenedWorkspace) {
+                return { ok: true, absolutePath: resolved, layer: 'overlay', diagnostics };
+            }
+            if (layer === 'base'
+                || (baseRoot
+                    && physicalBaseRoot
+                    && isInsideSelectedOrPhysicalRoot(baseRoot, physicalBaseRoot, resolved))) {
+                diagnostics.push({
+                    severity: 'error',
+                    code: 'WRITE_TO_BASE_FORBIDDEN',
+                    message: '这个文件不在当前打开的工作区里，无法写入。',
+                    details: { absolutePath: resolved, ...(baseRoot ? { baseRoot } : {}) }
+                });
+                return { ok: false, layer: 'overlay', diagnostics };
+            }
+            diagnostics.push({
+                severity: 'error',
+                code: 'WRITE_OUTSIDE_OVERLAY',
+                message: 'Writable paths must stay inside the opened Mod workspace.',
+                details: { absolutePath: resolved, overlayRoot }
+            });
+            return { ok: false, layer: 'overlay', diagnostics };
+        },
+        async resolveWritablePathSecure(absolutePath, layer = 'overlay') {
+            const lexical = session.resolveWritablePath(absolutePath, layer);
+            if (!lexical.ok || !lexical.absolutePath)
+                return lexical;
+            const allowedRoot = layer === 'staging'
+                ? stagingRoot
+                : selectMatchingRootNamespace(overlayRoot, physicalOverlayRoot, lexical.absolutePath);
+            if (!allowedRoot)
+                return lexical;
+            const verified = await verifyPathInsideRoot(allowedRoot, lexical.absolutePath);
+            return verified.ok
+                ? lexical
+                : {
+                    ok: false,
+                    layer,
+                    diagnostics: [...lexical.diagnostics, ...verified.diagnostics]
+                };
+        },
+        toOverlayPath(relativePath) {
+            return join(overlayRoot, normalizeRelative(relativePath));
+        },
+        toBasePath(relativePath) {
+            if (!baseRoot)
+                return undefined;
+            return join(baseRoot, normalizeRelative(relativePath));
+        }
+    };
+    return session;
+}
+/**
+ * Reject the removed path/locator contract at the runtime boundary too, so
+ * stale JavaScript callers receive a useful diagnostic instead of silently
+ * reintroducing a third-party schema dependency.
+ */
+export function assertNoExternalEmedfOptions(input) {
+    if (input === null || typeof input !== 'object' || Array.isArray(input))
+        return;
+    const record = input;
+    if (!Object.prototype.hasOwnProperty.call(record, 'emedfPath')
+        && !Object.prototype.hasOwnProperty.call(record, 'emedfLocator'))
+        return;
+    const error = new Error('生产会话不接受外部 EMEDF schema；请使用 SoulForge 内置 schema。');
+    error.code = EMEVD_EXTERNAL_SCHEMA_FORBIDDEN_CODE;
+    error.diagnostics = [{
+            severity: 'error',
+            code: EMEVD_EXTERNAL_SCHEMA_FORBIDDEN_CODE,
+            message: '生产会话不接受外部 EMEDF schema；请使用 SoulForge 内置 schema。'
+        }];
+    throw error;
+}
+export function assertWritableThroughSession(session, absolutePath) {
+    if (!session)
+        return [];
+    return session.resolveWritablePath(absolutePath).diagnostics;
+}
+export async function assertWritableThroughSessionSecure(session, absolutePath) {
+    if (!session)
+        return [];
+    return (await session.resolveWritablePathSecure(absolutePath)).diagnostics;
+}
+function isInsideSelectedOrPhysicalRoot(selectedRoot, physicalRoot, candidatePath) {
+    return isPathInside(selectedRoot, candidatePath)
+        || isPathInside(physicalRoot, candidatePath);
+}
+function selectMatchingRootNamespace(selectedRoot, physicalRoot, candidatePath) {
+    return isPathInside(selectedRoot, candidatePath) ? selectedRoot : physicalRoot;
+}
+function normalizeRelative(relativePath) {
+    const normalized = relativePath.replaceAll('\\', '/').replace(/^\/+/, '');
+    const segments = normalized.split('/');
+    if (segments.some((segment) => segment === '..') || normalized.length === 0) {
+        throw new Error(`Relative path escapes workspace: ${relativePath}`);
+    }
+    return normalized;
+}
+async function assertDirectory(path, label) {
+    try {
+        await access(path, constants.F_OK);
+    }
+    catch {
+        throw new Error(`${label} does not exist: ${path}`);
+    }
+    const info = await stat(path);
+    if (!info.isDirectory())
+        throw new Error(`${label} is not a directory: ${path}`);
+}
+//# sourceMappingURL=workspaceSession.js.map

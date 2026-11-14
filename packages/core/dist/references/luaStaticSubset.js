@@ -1,0 +1,631 @@
+/** Build the source-only structural layer used by the Agent. */
+export function buildLuaStructureIndex(text, parsed = parseLuaStaticSubset(text)) {
+    const { tokens } = tokenizeLua(text);
+    const offsets = lineOffsets(text);
+    const functions = [];
+    const goals = [];
+    const branches = [];
+    const structureDiagnostics = [];
+    const constants = parsed.bindings
+        .filter((binding) => !binding.isFunction && !binding.modified && binding.literal !== undefined)
+        .map((binding) => ({ name: binding.name, value: binding.literal, span: binding.span }));
+    for (let index = 0; index < tokens.length; index += 1) {
+        const token = tokens[index];
+        if (token.type === 'keyword' && token.value === 'function') {
+            const nameTokens = [];
+            let cursor = index + 1;
+            if (tokens[cursor]?.type === 'name') {
+                nameTokens.push(tokens[cursor]);
+                cursor += 1;
+                while ((tokens[cursor]?.value === '.' || tokens[cursor]?.value === ':') && tokens[cursor + 1]?.type === 'name') {
+                    nameTokens.push(tokens[cursor + 1]);
+                    cursor += 2;
+                }
+            }
+            // Native decompiled AI uses `Goal.ActXX = function (...)`, not only
+            // declaration syntax. Recover a simple static assignment name; table
+            // indexing and expressions deliberately remain anonymous.
+            if (nameTokens.length === 0 && tokens[index - 1]?.value === '=' && tokens[index - 2]?.type === 'name') {
+                let lhs = index - 2;
+                nameTokens.unshift(tokens[lhs]);
+                while (tokens[lhs - 1]?.value === '.' && tokens[lhs - 2]?.type === 'name') {
+                    lhs -= 2;
+                    nameTokens.unshift(tokens[lhs]);
+                }
+            }
+            const name = nameTokens.length > 0 ? nameTokens.map((item) => item.value).join('.') : '<anonymous>';
+            const endToken = findBlockEnd(tokens, index);
+            if (!endToken)
+                structureDiagnostics.push(`LUA_UNCLOSED_FUNCTION: ${name} at ${token.start}`);
+            const span = spanFromOffsets(text, token.start, endToken?.end ?? token.end, offsets);
+            const record = { name, kind: /^(?:goal|Goal)(?:_|\.|$)/u.test(name) ? 'goal' : 'function', span };
+            functions.push(record);
+            if (record.kind === 'goal')
+                goals.push(record);
+        }
+        if (token.type === 'keyword' && ['if', 'elseif', 'else', 'while', 'for', 'repeat'].includes(token.value)) {
+            const end = branchEnd(tokens, index, token.value);
+            const conditionTokens = tokens.slice(index + 1, end.conditionEndIndex);
+            branches.push({
+                kind: token.value,
+                span: spanFromOffsets(text, token.start, end.endOffset, offsets),
+                ...(conditionTokens.length > 0 ? { conditionText: text.slice(conditionTokens[0].start, conditionTokens.at(-1).end) } : {})
+            });
+        }
+    }
+    const unsupportedApis = parsed.calls
+        .filter((call) => !call.isLocal && !call.isRequire)
+        .map((call) => ({ callee: call.callee, span: call.span }));
+    return {
+        status: parsed.lexTruncated || structureDiagnostics.length > 0 || parsed.diagnostics.some((item) => item.severity === 'error') ? 'partial' : 'complete',
+        functions,
+        goals,
+        branches,
+        constants,
+        unsupportedApis,
+        ...(parsed.diagnostics.length > 0 || structureDiagnostics.length > 0
+            ? { diagnostics: [...parsed.diagnostics.map((item) => `${item.code}: ${item.message}`), ...structureDiagnostics] } : {})
+    };
+}
+function findBlockEnd(tokens, start) {
+    let depth = 0;
+    let pendingLoopDo = 0;
+    for (let index = start; index < tokens.length; index += 1) {
+        const token = tokens[index];
+        if (token.type === 'keyword' && (token.value === 'for' || token.value === 'while')) {
+            depth += 1;
+            pendingLoopDo += 1;
+        }
+        else if (token.type === 'keyword' && token.value === 'do' && pendingLoopDo > 0)
+            pendingLoopDo -= 1;
+        else if (token.type === 'keyword' && ['function', 'if', 'do', 'repeat'].includes(token.value))
+            depth += 1;
+        else if (token.type === 'keyword' && (token.value === 'end' || token.value === 'until')) {
+            depth -= 1;
+            if (depth === 0)
+                return token;
+        }
+    }
+    return undefined;
+}
+function branchEnd(tokens, start, kind) {
+    if (kind === 'else' || kind === 'repeat')
+        return { endOffset: tokens[start].end, conditionEndIndex: start };
+    for (let index = start + 1; index < tokens.length; index += 1) {
+        if (tokens[index]?.value === 'then' || tokens[index]?.value === 'do') {
+            return { endOffset: tokens[index].end, conditionEndIndex: index };
+        }
+        if (tokens[index]?.type === 'keyword' && ['if', 'for', 'while', 'function', 'end'].includes(tokens[index].value))
+            break;
+    }
+    return { endOffset: tokens[start].end, conditionEndIndex: start + 1 };
+}
+const LUA_KEYWORDS = new Set([
+    'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for', 'function', 'goto',
+    'if', 'in', 'local', 'nil', 'not', 'or', 'repeat', 'return', 'then', 'true', 'until', 'while'
+]);
+/** Keywords that open a lexical scope closed by `end`/`until`. */
+const SCOPE_OPENERS = new Set(['do', 'then', 'function', 'repeat']);
+const MAX_LEX_DIAGNOSTICS = 50;
+/* ------------------------------------------------------------------ */
+/*  Lexer                                                              */
+/* ------------------------------------------------------------------ */
+export function tokenizeLua(text) {
+    const tokens = [];
+    const diagnostics = [];
+    const pushDiagnostic = (diagnostic) => {
+        if (diagnostics.length < MAX_LEX_DIAGNOSTICS)
+            diagnostics.push(diagnostic);
+    };
+    let i = 0;
+    const length = text.length;
+    const isNameStart = (ch) => /[A-Za-z_]/u.test(ch);
+    const isNamePart = (ch) => /[A-Za-z0-9_]/u.test(ch);
+    /** Read a `[=*[` long-bracket opener at `pos`; returns level and content start, or null. */
+    const readLongBracket = (pos) => {
+        if (text[pos] !== '[')
+            return null;
+        let cursor = pos + 1;
+        let level = 0;
+        while (text[cursor] === '=') {
+            level += 1;
+            cursor += 1;
+        }
+        if (text[cursor] !== '[')
+            return null;
+        return { level, contentStart: cursor + 1 };
+    };
+    const skipLongBracket = (pos, level) => {
+        const closer = `]${'='.repeat(level)}]`;
+        const found = text.indexOf(closer, pos);
+        return found === -1 ? -1 : found + closer.length;
+    };
+    while (i < length) {
+        const ch = text[i];
+        if (ch === '\r' || ch === '\n' || ch === ' ' || ch === '\t' || ch === '\f' || ch === '\v') {
+            i += 1;
+            continue;
+        }
+        // Comments (line and long).
+        if (ch === '-' && text[i + 1] === '-') {
+            const bracket = readLongBracket(i + 2);
+            if (bracket) {
+                const end = skipLongBracket(bracket.contentStart, bracket.level);
+                if (end === -1) {
+                    pushDiagnostic({
+                        severity: 'error',
+                        code: 'LUA_UNTERMINATED_LONG_COMMENT',
+                        message: `起始于偏移 ${i} 的长注释没有闭合，词法分析在此停止。`,
+                        span: { startLine: 0, startColumn: 0, endLine: 0, endColumn: 0, startOffset: i, endOffset: length }
+                    });
+                    return { tokens, diagnostics };
+                }
+                i = end;
+                continue;
+            }
+            const newline = text.indexOf('\n', i);
+            i = newline === -1 ? length : newline + 1;
+            continue;
+        }
+        // Long strings.
+        if (ch === '[') {
+            const bracket = readLongBracket(i);
+            if (bracket) {
+                const end = skipLongBracket(bracket.contentStart, bracket.level);
+                if (end === -1) {
+                    pushDiagnostic({
+                        severity: 'error',
+                        code: 'LUA_UNTERMINATED_LONG_STRING',
+                        message: `起始于偏移 ${i} 的长字符串没有闭合，词法分析在此停止。`,
+                        span: { startLine: 0, startColumn: 0, endLine: 0, endColumn: 0, startOffset: i, endOffset: length }
+                    });
+                    return { tokens, diagnostics };
+                }
+                tokens.push({ type: 'string', value: text.slice(i, end), start: i, end });
+                i = end;
+                continue;
+            }
+        }
+        // Quoted strings.
+        if (ch === '"' || ch === "'") {
+            let cursor = i + 1;
+            let closed = false;
+            while (cursor < length) {
+                const current = text[cursor];
+                if (current === '\\') {
+                    cursor += 2;
+                    continue;
+                }
+                if (current === '\n')
+                    break;
+                if (current === ch) {
+                    closed = true;
+                    cursor += 1;
+                    break;
+                }
+                cursor += 1;
+            }
+            if (!closed) {
+                pushDiagnostic({
+                    severity: 'error',
+                    code: 'LUA_UNTERMINATED_STRING',
+                    message: `起始于偏移 ${i} 的字符串字面量未闭合，词法分析在此停止。`,
+                    span: { startLine: 0, startColumn: 0, endLine: 0, endColumn: 0, startOffset: i, endOffset: length }
+                });
+                return { tokens, diagnostics };
+            }
+            tokens.push({ type: 'string', value: text.slice(i, cursor), start: i, end: cursor });
+            i = cursor;
+            continue;
+        }
+        // Numbers (decimal, float, exponent, hex).
+        if (/[0-9]/u.test(ch) || (ch === '.' && /[0-9]/u.test(text[i + 1] ?? ''))) {
+            const rest = text.slice(i);
+            const numeric = /^(?:0[xX][0-9a-fA-F]+|(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?)/u.exec(rest);
+            if (numeric) {
+                tokens.push({ type: 'number', value: numeric[0], start: i, end: i + numeric[0].length });
+                i += numeric[0].length;
+                continue;
+            }
+        }
+        // Names and keywords.
+        if (isNameStart(ch)) {
+            let cursor = i + 1;
+            while (cursor < length && isNamePart(text[cursor]))
+                cursor += 1;
+            const value = text.slice(i, cursor);
+            tokens.push({
+                type: LUA_KEYWORDS.has(value) ? 'keyword' : 'name',
+                value,
+                start: i,
+                end: cursor
+            });
+            i = cursor;
+            continue;
+        }
+        if (text.slice(i, i + 3) === '...') {
+            tokens.push({ type: 'punct', value: '...', start: i, end: i + 3 });
+            i += 3;
+            continue;
+        }
+        // Multi-character operators before single punctuation.
+        const two = text.slice(i, i + 2);
+        if (two === '==' || two === '~=' || two === '<=' || two === '>=' || two === '..' || two === '::' || two === '//') {
+            tokens.push({ type: 'punct', value: two, start: i, end: i + 2 });
+            i += 2;
+            continue;
+        }
+        if ('(){}[],;.:+-*/%^<>=#'.includes(ch)) {
+            tokens.push({ type: 'punct', value: ch, start: i, end: i + 1 });
+            i += 1;
+            continue;
+        }
+        // Anything else is outside the supported subset: stop rather than guess.
+        pushDiagnostic({
+            severity: 'error',
+            code: 'LUA_UNSUPPORTED_CHARACTER',
+            message: `偏移 ${i} 处的字符「${ch}」不在受限 Lua 子集内，解析在此停止。`,
+            span: { startLine: 0, startColumn: 0, endLine: 0, endColumn: 0, startOffset: i, endOffset: i + 1 }
+        });
+        return { tokens, diagnostics };
+    }
+    return { tokens, diagnostics };
+}
+/* ------------------------------------------------------------------ */
+/*  Spans                                                              */
+/* ------------------------------------------------------------------ */
+/** Line start offsets computed once; spans are derived, never guessed. */
+export function lineOffsets(text) {
+    const offsets = [0];
+    for (let i = 0; i < text.length; i += 1) {
+        if (text[i] === '\n')
+            offsets.push(i + 1);
+    }
+    return offsets;
+}
+export function spanFromOffsets(text, start, end, offsets) {
+    const lineOf = (offset) => {
+        let low = 0;
+        let high = offsets.length - 1;
+        while (low < high) {
+            const mid = (low + high + 1) >> 1;
+            if (offsets[mid] <= offset)
+                low = mid;
+            else
+                high = mid - 1;
+        }
+        return { line: low, column: offset - offsets[low] };
+    };
+    const from = lineOf(start);
+    const to = lineOf(end);
+    return {
+        startLine: from.line,
+        startColumn: from.column,
+        endLine: to.line,
+        endColumn: to.column,
+        startOffset: start,
+        endOffset: end
+    };
+}
+/**
+ * Parse the bounded static subset. The walker is statement-oriented and
+ * deliberately conservative: anything it cannot classify is recorded in
+ * `diagnostics` instead of being silently skipped.
+ */
+export function parseLuaStaticSubset(text) {
+    const { tokens, diagnostics } = tokenizeLua(text);
+    const offsets = lineOffsets(text);
+    const calls = [];
+    const frames = [{ bindings: new Map() }];
+    const bindings = [];
+    const lexTruncated = diagnostics.some((item) => item.severity === 'error');
+    const declare = (name, token, extra) => {
+        const record = {
+            name,
+            depth: frames.length - 1,
+            span: spanFromOffsets(text, token.start, token.end, offsets),
+            ...extra
+        };
+        frames[frames.length - 1].bindings.set(name, record);
+        bindings.push(record);
+    };
+    const lookup = (name) => {
+        for (let index = frames.length - 1; index >= 0; index -= 1) {
+            const found = frames[index].bindings.get(name);
+            if (found)
+                return found;
+        }
+        return undefined;
+    };
+    const pushFrame = () => { frames.push({ bindings: new Map() }); };
+    const popFrame = () => { if (frames.length > 1)
+        frames.pop(); };
+    const isPunct = (token, value) => token !== undefined && token.type === 'punct' && token.value === value;
+    const isKeyword = (token, value) => token !== undefined && token.type === 'keyword' && token.value === value;
+    const isName = (token) => token?.type === 'name';
+    for (let i = 0; i < tokens.length; i += 1) {
+        const token = tokens[i];
+        if (token.type === 'keyword') {
+            if (token.value === 'local') {
+                const next = tokens[i + 1];
+                if (isKeyword(next, 'function')) {
+                    const name = tokens[i + 2];
+                    if (name && isName(name)) {
+                        // Definition, not a call; its name shadows a global from here on.
+                        declare(name.value, name, { isFunction: true, modified: false });
+                        pushFrame();
+                        i += 2;
+                        continue;
+                    }
+                }
+                if (isName(next)) {
+                    // `local a[, b]... [= <literal | expr>]` — a literal binding is only
+                    // recorded for a single name with a single literal initialiser.
+                    let cursor = i + 1;
+                    const names = [];
+                    while (isName(tokens[cursor])) {
+                        names.push(tokens[cursor]);
+                        cursor += 1;
+                        if (isPunct(tokens[cursor], ',')) {
+                            cursor += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    const hasValue = isPunct(tokens[cursor], '=');
+                    const valueToken = hasValue ? tokens[cursor + 1] : undefined;
+                    const literal = valueToken ? literalOf(valueToken) : undefined;
+                    const single = names.length === 1;
+                    for (const name of names) {
+                        declare(name.value, name, {
+                            ...(single && literal !== undefined ? { literal } : {}),
+                            isFunction: false,
+                            modified: hasValue && !(single && literal !== undefined)
+                        });
+                    }
+                    if (hasValue && !(single && literal !== undefined)) {
+                        diagnostics.push({
+                            severity: 'warning',
+                            code: 'LUA_LOCAL_NON_LITERAL',
+                            message: `局部 ${names.map((item) => item.value).join(', ')} 的初始值不是可静态解析的字面量，按动态值处理。`,
+                            span: valueToken
+                                ? spanFromOffsets(text, valueToken.start, valueToken.end, offsets)
+                                : spanFromOffsets(text, token.start, token.end, offsets)
+                        });
+                    }
+                    // Resume right after `local`; the RHS (which may itself contain
+                    // calls like `local x = compute()`) is re-scanned, never skipped.
+                    i = cursor - 1;
+                    continue;
+                }
+                diagnostics.push({
+                    severity: 'warning',
+                    code: 'LUA_UNSUPPORTED_LOCAL_FORM',
+                    message: `偏移 ${token.start} 的 local 声明形式不在受限子集内，其作用域影响未计入。`,
+                    span: spanFromOffsets(text, token.start, token.end, offsets)
+                });
+                continue;
+            }
+            if (token.value === 'function') {
+                // `function NAME(` / `function a.b:c(` — the name is a definition.
+                pushFrame();
+                continue;
+            }
+            if (SCOPE_OPENERS.has(token.value)) {
+                pushFrame();
+                continue;
+            }
+            if (token.value === 'end' || token.value === 'until') {
+                popFrame();
+                continue;
+            }
+            continue;
+        }
+        if (token.type !== 'name')
+            continue;
+        // Plain assignment `NAME = ...` invalidates a unique literal binding.
+        if (isPunct(tokens[i + 1], '=') && !isPunct(tokens[i + 2], '=')) {
+            const binding = lookup(token.value);
+            if (binding)
+                binding.modified = true;
+            continue;
+        }
+        // Call expression: NAME (. NAME | : NAME)* ( args ) | string | table
+        let cursor = i + 1;
+        const chain = [token.value];
+        let chainEnd = token.end;
+        while ((isPunct(tokens[cursor], '.') || isPunct(tokens[cursor], ':')) && isName(tokens[cursor + 1])) {
+            chain.push(tokens[cursor + 1].value);
+            chainEnd = tokens[cursor + 1].end;
+            cursor += 2;
+        }
+        const callee = chain.join('.');
+        const rootName = chain[0];
+        const binding = lookup(rootName);
+        const isLocal = binding !== undefined;
+        const open = tokens[cursor];
+        let args = [];
+        let callEnd = chainEnd;
+        if (isPunct(open, '(')) {
+            const parsed = readArguments(tokens, cursor + 1, text, offsets);
+            args = parsed.args;
+            cursor = parsed.next;
+            callEnd = tokens[cursor - 1]?.end ?? chainEnd;
+        }
+        else if (open && (open.type === 'string' || isPunct(open, '{'))) {
+            const parsed = open.type === 'string'
+                ? { args: [classifyArgSegment([open], text, offsets)], next: cursor + 1 }
+                : readTableArg(tokens, cursor, text, offsets);
+            args = parsed.args;
+            cursor = parsed.next;
+            callEnd = tokens[cursor - 1]?.end ?? chainEnd;
+        }
+        else {
+            continue;
+        }
+        calls.push({
+            callee,
+            rootName,
+            calleeSpan: spanFromOffsets(text, token.start, chainEnd, offsets),
+            span: spanFromOffsets(text, token.start, callEnd, offsets),
+            args,
+            isLocal,
+            shadowedGlobal: isLocal && chain.length === 1,
+            isRequire: chain.length === 1 && rootName === 'require'
+        });
+        i = cursor - 1;
+    }
+    return { calls, bindings, diagnostics, lexTruncated };
+}
+function literalOf(token) {
+    if (token.type === 'string')
+        return decodeLuaString(token.value);
+    if (token.type === 'number')
+        return parseLuaNumber(token.value);
+    if (token.type === 'keyword' && token.value === 'true')
+        return true;
+    if (token.type === 'keyword' && token.value === 'false')
+        return false;
+    if (token.type === 'keyword' && token.value === 'nil')
+        return null;
+    return undefined;
+}
+/**
+ * Read a comma-separated argument list up to its matching `)`. Nested
+ * parens/braces/brackets are tracked by depth; a bare name becomes `name`, a
+ * dotted chain becomes `member`, a literal token becomes `literal`, anything
+ * else is `expression` — never guessed.
+ */
+function readArguments(tokens, start, text, offsets) {
+    const args = [];
+    let cursor = start;
+    let depth = 0;
+    let segmentStart = cursor;
+    const flush = () => {
+        if (segmentStart >= cursor) {
+            segmentStart = cursor;
+            return;
+        }
+        const arg = classifyArgSegment(tokens.slice(segmentStart, cursor), text, offsets);
+        if (arg)
+            args.push(arg);
+        segmentStart = cursor;
+    };
+    while (cursor < tokens.length) {
+        const token = tokens[cursor];
+        if (depth === 0 && isPunctToken(token, ')')) {
+            flush();
+            return { args, next: cursor + 1 };
+        }
+        if (isPunctToken(token, '(') || isPunctToken(token, '{') || isPunctToken(token, '['))
+            depth += 1;
+        else if (isPunctToken(token, ')') || isPunctToken(token, '}') || isPunctToken(token, ']'))
+            depth -= 1;
+        else if (depth === 0 && isPunctToken(token, ',')) {
+            flush();
+            cursor += 1;
+            segmentStart = cursor;
+            continue;
+        }
+        cursor += 1;
+    }
+    flush();
+    return { args, next: cursor };
+}
+function readTableArg(tokens, start, text, offsets) {
+    let cursor = start;
+    let depth = 0;
+    while (cursor < tokens.length) {
+        const token = tokens[cursor];
+        if (isPunctToken(token, '{'))
+            depth += 1;
+        else if (isPunctToken(token, '}'))
+            depth -= 1;
+        cursor += 1;
+        if (depth === 0)
+            break;
+    }
+    const arg = classifyArgSegment(tokens.slice(start, cursor), text, offsets);
+    return { args: arg ? [arg] : [], next: cursor };
+}
+function classifyArgSegment(segment, text, offsets) {
+    if (segment.length === 0)
+        return null;
+    const first = segment[0];
+    const last = segment[segment.length - 1];
+    const span = spanFromOffsets(text, first.start, last.end, offsets);
+    const sourceText = text.slice(first.start, last.end);
+    if (segment.length === 1) {
+        const literal = literalOf(first);
+        if (first.type === 'string' || first.type === 'number'
+            || (first.type === 'keyword' && (first.value === 'true' || first.value === 'false' || first.value === 'nil'))) {
+            return { kind: 'literal', text: sourceText, span, ...(literal !== undefined ? { literal } : {}) };
+        }
+        if (first.type === 'name')
+            return { kind: 'name', text: sourceText, span };
+    }
+    const dottedChain = segment.length > 1 && segment.every((token, index) => index % 2 === 0 ? token.type === 'name' : isPunctToken(token, '.'));
+    if (dottedChain)
+        return { kind: 'member', text: sourceText, span };
+    if (isPunctToken(first, '{'))
+        return { kind: 'table', text: sourceText, span };
+    return { kind: 'expression', text: sourceText, span };
+}
+function isPunctToken(token, value) {
+    return token.type === 'punct' && token.value === value;
+}
+/** Decode a quoted or long-bracket Lua string literal to its content. */
+export function decodeLuaString(raw) {
+    const open = /^\[=*\[/.exec(raw);
+    if (open) {
+        const closer = `]${open[0].slice(1, -1)}]`;
+        return raw.slice(open[0].length, raw.length - closer.length);
+    }
+    const body = raw.slice(1, -1);
+    if (!body.includes('\\'))
+        return body;
+    let out = '';
+    for (let i = 0; i < body.length; i += 1) {
+        const ch = body[i];
+        if (ch !== '\\') {
+            out += ch;
+            continue;
+        }
+        const next = body[i + 1];
+        i += 1;
+        switch (next) {
+            case 'n':
+                out += '\n';
+                break;
+            case 't':
+                out += '\t';
+                break;
+            case 'r':
+                out += '\r';
+                break;
+            case '\\':
+                out += '\\';
+                break;
+            case '"':
+                out += '"';
+                break;
+            case "'":
+                out += "'";
+                break;
+            case undefined: break;
+            default:
+                out += next;
+                break;
+        }
+    }
+    return out;
+}
+export function parseLuaNumber(raw) {
+    if (/^0[xX][0-9a-fA-F]+$/u.test(raw)) {
+        const parsed = Number.parseInt(raw, 16);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+//# sourceMappingURL=luaStaticSubset.js.map

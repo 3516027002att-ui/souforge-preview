@@ -1,0 +1,183 @@
+/**
+ * AI 工具权限阶梯的**生产**路径验证。
+ *
+ * 为什么必须单独有这条：runAiConformanceSmoke 里有 5 个 case 断言的是
+ * testing/harness 下的 evaluatePolicyGate / maxPermissionFromMode /
+ * executeToolThroughPolicy —— 那三个符号全仓**只存在于 testing 目录**，是测试
+ * 装置自建的权限阶梯。生产判定走的是另一套：ai/toolPermissions.ts 的
+ * decideAiToolPermission，由 ai/toolRegistry.ts 在每次 run 时调用。
+ *
+ * 后果是「AI 不得抬高授权」这条安全边界在生产实现上几乎没有断言：改坏
+ * maxPermissionForMode（例如让 plan 模式返回 rollback），conformance 的 58 个
+ * case 照样全绿，因为它们断言的是 harness 自己的阶梯。
+ *
+ * 本文件只断言生产符号：权限秩序、每个模式的上限、以及 ToolRegistry.run 真的
+ * 会以 TOOL_PERMISSION_DENIED 拦住越权工具。
+ *
+ * Authority: unit —— 纯逻辑，无 Bridge / 无真机语料。它不声明 AI 能力，
+ * 只声明权限判定按登记的阶梯执行。
+ */
+import { AI_TOOL_PERMISSION_ORDER, decideAiToolPermission, isAiToolPermissionAllowed, legacyPermissionToLevel, maxPermissionForMode } from '../ai/toolPermissions.js';
+import { ToolRegistry } from '../ai/toolRegistry.js';
+import { isToolAllowedInMode } from '../model-services/agentLoop.js';
+const failures = [];
+let checks = 0;
+function check(name, condition, detail) {
+    checks += 1;
+    if (!condition)
+        failures.push(detail === undefined ? name : `${name} —— ${detail}`);
+}
+/* ---- 1. 阶梯本身 -------------------------------------------------------- */
+check('ladder/order-is-ascending-and-complete', AI_TOOL_PERMISSION_ORDER.length === 7
+    && AI_TOOL_PERMISSION_ORDER[0] === 'read'
+    && AI_TOOL_PERMISSION_ORDER[6] === 'rollback', `实测 ${JSON.stringify(AI_TOOL_PERMISSION_ORDER)}`);
+// 阶梯必须严格单调：低秩允许时高秩不得也被允许（否则「上限」失去意义）。
+for (const mode of ['plan', 'normal', 'fullPermission']) {
+    const allowed = AI_TOOL_PERMISSION_ORDER.filter((level) => isAiToolPermissionAllowed(level, mode));
+    const denied = AI_TOOL_PERMISSION_ORDER.filter((level) => !isAiToolPermissionAllowed(level, mode));
+    // 允许集必须是阶梯的前缀：出现「允许 commit 但拒绝 stage」这种空洞，说明
+    // 秩序表与判定函数已分叉。
+    const expectedPrefix = AI_TOOL_PERMISSION_ORDER.slice(0, allowed.length);
+    check(`ladder/allowed-is-prefix/${mode}`, allowed.every((level, index) => level === expectedPrefix[index]), `allowed=${JSON.stringify(allowed)} denied=${JSON.stringify(denied)}`);
+}
+/* ---- 2. 每个模式的上限（这是「不得抬高授权」的具体判据）----------------- */
+const MODE_CEILINGS = [
+    ['plan', 'propose'],
+    ['normal', 'commit'],
+    ['fullPermission', 'rollback']
+];
+for (const [mode, ceiling] of MODE_CEILINGS) {
+    check(`ceiling/${mode}`, maxPermissionForMode(mode) === ceiling, `期望 ${ceiling}，实测 ${maxPermissionForMode(mode)}`);
+}
+// plan 允许提出提案，但不得进入 staging/validation/commit/rollback。
+check('ceiling/plan-allows-propose', isAiToolPermissionAllowed('propose', 'plan'));
+check('ceiling/plan-denies-stage', !isAiToolPermissionAllowed('stage', 'plan'));
+check('ceiling/plan-denies-validate', !isAiToolPermissionAllowed('validate', 'plan'));
+check('ceiling/plan-denies-commit', !isAiToolPermissionAllowed('commit', 'plan'));
+check('ceiling/plan-denies-rollback', !isAiToolPermissionAllowed('rollback', 'plan'));
+check('ceiling/normal-allows-commit', isAiToolPermissionAllowed('commit', 'normal'));
+check('ceiling/normal-denies-rollback', !isAiToolPermissionAllowed('rollback', 'normal'));
+// fullPermission 必须允许全部级别，否则「完全权限」名不副实。
+for (const level of AI_TOOL_PERMISSION_ORDER) {
+    check(`ceiling/fullPermission-allows-${level}`, isAiToolPermissionAllowed(level, 'fullPermission'), `fullPermission 应允许 ${level}`);
+}
+/* ---- 3. legacy 标签映射 -------------------------------------------------- */
+for (const [legacy, expected] of [
+    ['read', 'read'],
+    ['plan', 'propose'],
+    ['write', 'commit']
+]) {
+    check(`legacy/${legacy}`, legacyPermissionToLevel(legacy) === expected, `期望 ${expected}，实测 ${legacyPermissionToLevel(legacy)}`);
+}
+/* ---- 4. ToolRegistry.run 真的会拦住越权工具 ------------------------------
+ * 前面三节断言的是纯函数；这一节断言**执行路径**真的调用了它们。判据分开写的
+ * 理由：判定函数正确但 run 忘记调用它，是最典型的「安全层写了但没接上」形态。
+ */
+function contextFor(mode) {
+    return { mode };
+}
+async function verifyRegistryGate() {
+    const registry = new ToolRegistry();
+    let commitToolRan = false;
+    // inputSchema 省略：ToolInputShape 是「字段名 -> 类型串」的简单契约，不是
+    // JSON Schema。这里要测的是权限门，不是输入校验，空契约让输入校验直接放行。
+    registry.register({
+        name: 'test_commit_tool',
+        description: 'Commit-level tool used to verify the registry permission gate.',
+        permission: 'write',
+        permissionLevel: 'commit',
+        run: async () => {
+            commitToolRan = true;
+            return { ok: true, data: null };
+        }
+    });
+    // plan 模式：必须被拒，且**不得执行工具体**。只断言返回码不够——工具已经跑过
+    // 再报错，副作用已经发生。
+    const denied = await registry.run('test_commit_tool', {}, contextFor('plan'));
+    check('registry/denies-commit-in-plan', denied.ok === false && denied.error?.code === 'TOOL_PERMISSION_DENIED', `实测 ${JSON.stringify(denied)}`);
+    check('registry/tool-body-not-executed-when-denied', commitToolRan === false);
+    // 拒绝文案是模型唯一的补救线索：它只许列真能到位的模式。旧文案对 rollback 被拒
+    // 的建议是「用 --mode normal」，而 normal 的上限就是 commit —— 照着它重试永远
+    // 不可能成功。这两条断言把「文案不得推荐刚拒绝它的模式」钉在门禁里。
+    const planDeniedMessage = denied.ok === false ? (denied.error?.message ?? '') : '';
+    check('registry/denial-message-never-names-the-denying-mode', planDeniedMessage !== '' && !planDeniedMessage.includes('--mode plan'), `实测 ${planDeniedMessage}`);
+    check('registry/denial-message-names-a-mode-that-reaches-the-permission', planDeniedMessage.includes('--mode normal'), `实测 ${planDeniedMessage}`);
+    let rollbackToolRan = false;
+    registry.register({
+        name: 'test_rollback_tool',
+        description: 'Rollback-level tool used to verify the denial message does not recommend a mode that cannot reach it.',
+        permission: 'read',
+        permissionLevel: 'rollback',
+        run: async () => {
+            rollbackToolRan = true;
+            return { ok: true, data: null };
+        }
+    });
+    const rollbackDenied = await registry.run('test_rollback_tool', {}, contextFor('normal'));
+    const rollbackMessage = rollbackDenied.ok === false ? (rollbackDenied.error?.message ?? '') : '';
+    check('registry/denies-rollback-in-normal', rollbackDenied.ok === false && rollbackDenied.error?.code === 'TOOL_PERMISSION_DENIED' && rollbackToolRan === false, `实测 ${JSON.stringify(rollbackDenied)} 工具体执行=${rollbackToolRan}`);
+    check('registry/rollback-denial-does-not-offer-normal', rollbackMessage !== '' && !rollbackMessage.includes('--mode normal'), `实测 ${rollbackMessage}`);
+    check('registry/rollback-denial-offers-fullPermission', rollbackMessage.includes('--mode fullPermission'), `实测 ${rollbackMessage}`);
+    // 宿主授权上限确实允许提升时，文案该给 switch_mode，而不是让用户去重启 CLI。
+    const switchable = await registry.run('test_commit_tool', {}, { mode: 'plan', modeCeiling: 'fullPermission' });
+    const switchableMessage = switchable.ok === false ? (switchable.error?.message ?? '') : '';
+    check('registry/denial-offers-switch_mode-when-the-host-grant-allows-it', switchableMessage.includes('switch_mode')
+        && switchableMessage.includes('fullPermission')
+        && !switchableMessage.includes('--mode'), `实测 ${switchableMessage}`);
+    // fullPermission 模式：同一工具必须放行（否则上面的「被拒」可能只是因为
+    // 一切都被拒绝）。
+    const allowed = await registry.run('test_commit_tool', {}, contextFor('fullPermission'));
+    check('registry/allows-commit-in-fullPermission', allowed.ok === true && commitToolRan, `实测 ${JSON.stringify(allowed)} commitToolRan=${commitToolRan}`);
+    const runtimeCalls = new Set();
+    for (const level of ['propose', 'stage', 'validate']) {
+        registry.register({
+            name: `test_${level}_tool`,
+            description: `${level}-level tool used to compare registry and loop policy.`,
+            permission: level,
+            permissionLevel: level,
+            run: async () => {
+                runtimeCalls.add(level);
+                return { ok: true, data: null };
+            }
+        });
+    }
+    const runtimeLevels = new Map([
+        ['test_propose_tool', 'propose'],
+        ['test_stage_tool', 'stage'],
+        ['test_validate_tool', 'validate']
+    ]);
+    const runtimeRegistered = new Set(runtimeLevels.keys());
+    for (const [name, level] of runtimeLevels) {
+        const registryResult = await registry.run(name, {}, contextFor('plan'));
+        const loopResult = isToolAllowedInMode(name, 'plan', runtimeRegistered, runtimeLevels);
+        const expected = decideAiToolPermission(level, 'plan').allowed;
+        check(`runtime/${level}/registry-matches-shared-predicate`, registryResult.ok === expected, `registry=${JSON.stringify(registryResult)} expected=${expected}`);
+        check(`runtime/${level}/loop-matches-shared-predicate`, loopResult.ok === expected, `loop=${JSON.stringify(loopResult)} expected=${expected}`);
+        check(`runtime/${level}/execution-side-effect`, runtimeCalls.has(level) === expected, `calls=${JSON.stringify([...runtimeCalls])} expected=${expected}`);
+    }
+    // 未注册工具必须报 TOOL_NOT_FOUND，而不是被权限层吞掉。
+    const missing = await registry.run('no_such_tool', {}, contextFor('fullPermission'));
+    check('registry/unknown-tool-reports-not-found', missing.ok === false && missing.error?.code === 'TOOL_NOT_FOUND', `实测 ${JSON.stringify(missing)}`);
+}
+await verifyRegistryGate();
+/* ---- 输出 ---------------------------------------------------------------- */
+const ok = failures.length === 0;
+console.log(JSON.stringify({
+    ok,
+    smoke: 'ai-tool-permission',
+    message: ok
+        ? 'AI 工具权限阶梯（生产实现）全部断言通过'
+        : `${failures.length} 条断言失败`,
+    checks,
+    coveredProductionSymbols: [
+        'ai/toolPermissions.ts: AI_TOOL_PERMISSION_ORDER / maxPermissionForMode / decideAiToolPermission / isAiToolPermissionAllowed / legacyPermissionToLevel',
+        'ai/toolRegistry.ts: ToolRegistry.run 的 TOOL_PERMISSION_DENIED 与 TOOL_NOT_FOUND 分支'
+    ],
+    nonClaim: '本 smoke 只验证权限判定与注册表拦截，不验证任何 AI 能力，也不声明'
+        + '完全权限可绕过 Patch Engine（硬约束 11 由写入链路的门禁负责）。'
+        + '它也不覆盖 testing/harness 下那套自建权限阶梯——那是测试装置，不是生产。',
+    ...(ok ? {} : { failures })
+}, null, 2));
+if (!ok)
+    process.exit(1);
+//# sourceMappingURL=runAiToolPermissionSmoke.js.map

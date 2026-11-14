@@ -1,0 +1,5 @@
+#!/bin/sh
+SOULFORGE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export SOULFORGE_ROOT
+node "$(dirname "$0")/require-node.cjs" || exit 1
+exec node "$(dirname "$0")/sfcli.mjs" "$@"

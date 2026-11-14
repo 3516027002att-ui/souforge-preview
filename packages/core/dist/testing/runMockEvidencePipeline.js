@@ -1,0 +1,113 @@
+import { readFile } from 'node:fs/promises';
+import { createPatchProposal, dryRunPatchProposal } from '../patch/patchEngine.js';
+import { createUnifiedDiff } from '../patch/textDiff.js';
+import { parseEventText } from '../parsers/eventTextParser.js';
+import { parseMsgText } from '../parsers/msgTextParser.js';
+import { buildReferenceGraph } from '../references/referenceBuilder.js';
+import { scanWorkspace } from '../workspace/scanWorkspace.js';
+import { ingestBridgeResult } from '../indexing/ingestBridgeResult.js';
+import { WorkspaceIndex } from '../indexing/workspaceIndex.js';
+import { MemoryEvidenceStore } from '../storage/memoryEvidenceStore.js';
+import { createMockWorkspace } from './createMockWorkspace.js';
+/**
+ * Runs SoulForge's v0.1 core loop against synthetic data:
+ *
+ * scan -> parse text symbols -> ingest bridge-like JSON -> build references
+ * -> collect event evidence -> create text diff -> dry-run Patch Engine validation
+ */
+export async function runMockEvidencePipeline() {
+    const workspace = await createMockWorkspace();
+    const scan = await scanWorkspace({ workspaceRoot: workspace.root });
+    const index = new WorkspaceIndex(scan.workspaceId);
+    const store = new MemoryEvidenceStore();
+    index.setFiles(scan.files);
+    store.upsertWorkspace({
+        workspaceId: scan.workspaceId,
+        rootPath: scan.workspaceRoot,
+        game: 'unknown',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+    });
+    store.replaceFiles(scan.workspaceId, scan.files);
+    const diagnostics = [...scan.diagnostics];
+    const eventFile = scan.files.find((file) => file.relativePath.endsWith('.emevd.txt'));
+    if (!eventFile)
+        throw new Error('Mock event file missing after scan.');
+    const eventText = await readFile(eventFile.absolutePath, 'utf8');
+    const eventParse = parseEventText({
+        sourceUri: eventFile.sourceUri,
+        sourcePath: eventFile.relativePath,
+        text: eventText
+    });
+    diagnostics.push(...eventParse.diagnostics);
+    index.upsertEventExport(eventParse.export);
+    const msgFile = scan.files.find((file) => file.relativePath.endsWith('Goods.tsv'));
+    if (!msgFile)
+        throw new Error('Mock msg file missing after scan.');
+    const msgText = await readFile(msgFile.absolutePath, 'utf8');
+    const msgParse = parseMsgText({
+        sourceUri: msgFile.sourceUri,
+        sourcePath: msgFile.relativePath,
+        text: msgText,
+        category: 'Goods'
+    });
+    diagnostics.push(...msgParse.diagnostics);
+    index.upsertMsgExport(msgParse.export);
+    await ingestJsonFixture(index, workspace.files.mapJson, 'map', diagnostics);
+    await ingestJsonFixture(index, workspace.files.paramJson, 'param', diagnostics);
+    const references = buildReferenceGraph(index.toSymbolBundle(), { enableNumericFallback: true });
+    index.rebuildReferences({ enableNumericFallback: true });
+    store.replaceSymbols(scan.workspaceId, index.toSymbolBundle());
+    store.replaceReferences(scan.workspaceId, references.edges);
+    const explanation = index.buildEventExplanationInput('event://m11_00_00_00/11002800');
+    if (!explanation)
+        throw new Error('Mock event explanation could not be built.');
+    const nextEventText = eventText.replace('EnableCharacter(character=1100800);', 'EnableCharacter(character=1100800);\n  // SoulForge mock patch touched this event.');
+    const patchDiff = createUnifiedDiff(eventText, nextEventText, {
+        fromFile: eventFile.relativePath,
+        toFile: eventFile.relativePath,
+        contextLines: 3
+    });
+    const proposal = createPatchProposal({
+        workspaceId: scan.workspaceId,
+        title: 'Mock event text patch',
+        author: 'ai',
+        mode: 'plan',
+        changes: [
+            {
+                targetUri: eventFile.sourceUri,
+                targetPath: eventFile.absolutePath,
+                kind: 'text',
+                diff: patchDiff,
+                structuredEdit: { newText: nextEventText }
+            }
+        ]
+    });
+    const validation = await dryRunPatchProposal(proposal);
+    diagnostics.push(...validation.diagnostics);
+    return {
+        workspace,
+        scannedFileCount: scan.files.length,
+        diagnostics,
+        referenceStats: references.stats,
+        eventExplanationMarkdown: explanation.markdown,
+        patchDiff,
+        patchValidationOk: validation.ok
+    };
+}
+async function ingestJsonFixture(index, path, kind, diagnostics) {
+    const text = await readFile(path, 'utf8');
+    const data = JSON.parse(text);
+    const result = {
+        sourceUri: `file://${path}`,
+        sourcePath: path,
+        game: 'sekiro',
+        resourceKind: kind,
+        parseStatus: 'parsed',
+        diagnostics: [],
+        data
+    };
+    const ingest = ingestBridgeResult(index, result);
+    diagnostics.push(...ingest.diagnostics);
+}
+//# sourceMappingURL=runMockEvidencePipeline.js.map

@@ -1,0 +1,193 @@
+import { createSmokeTemporaryDirectory } from './harness/smokeWorkspace.js';
+/**
+ * PARAM Agent 门面：分组、字段编码、权限、禁止文本补丁打原生容器。
+ * 不落盘到用户 mods，不声明 native authority。
+ */
+import { readFileSync } from 'node:fs';
+import { access, mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { createDefaultToolRegistry } from '../ai/toolRegistry.js';
+import { WorkspaceIndex } from '../indexing/workspaceIndex.js';
+import { applyEditsToRowBytes, cleanupParamTempDirectory, groupParamEdits, normalizeTableToken } from '../param/containerParamEdit.js';
+import { applyParamFieldMutation } from '../param/paramFieldMutation.js';
+const failures = [];
+let checks = 0;
+function check(name, condition, detail) {
+    checks += 1;
+    if (!condition)
+        failures.push(detail === undefined ? name : `${name} —— ${detail}`);
+}
+const DEF = {
+    schemaVersion: 1,
+    typeName: 'DEMO_PARAM_ST',
+    version: 1,
+    rowDataSize: 16,
+    origin: 'fixture',
+    fields: [
+        { id: 'f_id', name: 'idHint', type: 's32', offset: 0, size: 4 },
+        { id: 'f_hp', name: 'hp', type: 'u16', offset: 4, size: 2, min: 0, max: 9999 },
+        { id: 'f_rate', name: 'rate', type: 'f32', offset: 8, size: 4 }
+    ]
+};
+const row = Buffer.alloc(16);
+row.writeInt32LE(7, 0);
+row.writeUInt16LE(100, 4);
+row.writeFloatLE(1.5, 8);
+const grouped = groupParamEdits([
+    { table: 'Bullet.param', rowId: 1, fieldId: 'life', value: 2 },
+    { table: 'AtkParam_Pc', rowId: 2, fieldId: 'atkStam', value: 8 },
+    { table: 'bullet', rowId: 3, fieldId: 'initVellocity', value: 640 }
+]);
+check('group/two-tables', grouped.size === 2, `size=${grouped.size}`);
+check('group/bullet-merged', (grouped.get('bullet')?.length ?? 0) === 2, `bullet=${grouped.get('bullet')?.length}`);
+check('normalize/basename', normalizeTableToken('N:\\\\SPRJ\\\\data\\\\Bullet.param') === 'bullet');
+const applied = applyEditsToRowBytes({
+    rowDataBase64: row.toString('base64'),
+    definition: DEF,
+    edits: [
+        { fieldId: 'f_hp', value: 200 },
+        { fieldId: 'f_rate', value: 3 }
+    ]
+});
+check('encode/ok', applied.ok === true);
+if (applied.ok) {
+    check('encode/before-hp', applied.before.f_hp === 100, `before=${String(applied.before.f_hp)}`);
+    check('encode/after-hp', applied.after.f_hp === 200, `after=${String(applied.after.f_hp)}`);
+    check('encode/before-rate', applied.before.f_rate === 1.5);
+    check('encode/after-rate', applied.after.f_rate === 3);
+    const again = applyParamFieldMutation({
+        rowDataBase64: applied.nextDataBase64,
+        definition: DEF,
+        fieldId: 'f_hp',
+        value: 200
+    });
+    check('encode/idempotent-ok', again.ok);
+}
+const missing = applyEditsToRowBytes({
+    rowDataBase64: row.toString('base64'),
+    definition: DEF,
+    edits: [{ fieldId: 'nope', value: 1 }]
+});
+check('encode/missing-field', missing.ok === false && missing.code === 'PARAMDEF_FIELD_NOT_FOUND');
+const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../src/param/containerParamEdit.ts'), 'utf8');
+check('source/uses-write-param', source.includes("command: 'write-param'") || source.includes('commitParamMutationsViaBridge'));
+check('source/uses-write-bnd4', source.includes("command: 'write-bnd4'"));
+check('source/uses-scoped-bridge-read', source.includes('createBridgeDaemonScope') && source.includes('bridgeScope.run'));
+check('source/disposes-scoped-bridge-read', source.includes('await bridgeScope.dispose()') && source.includes('finally'));
+check('source/no-smithbox-regex', !source.includes('FIELD_DEF ='));
+check('source/no-index-scan', !source.includes('index < 180'));
+// Product invariant: the Bridge is the only production decoder of a native format.
+// `read_param_fields` publishes the Bridge's decoded cells; the TS decoder survives only
+// in the writer's own before/after projection (there is no Bridge primitive for bytes
+// that are not on disk yet), so it must not be reachable from the read snapshot.
+const snapshotStart = source.indexOf('function snapshotParamReadCell');
+const snapshotBody = snapshotStart < 0 ? '' : source.slice(snapshotStart, source.indexOf('\n}', snapshotStart));
+check('source/read-projection-uses-bridge-cells', snapshotBody.includes('cells?.find') && !snapshotBody.includes('decodeRowFields') && !snapshotBody.includes('readFieldValue'), snapshotStart < 0 ? 'snapshotParamReadCell 不存在' : '读投影又自己解字段了：字段值必须来自 Bridge cells');
+check('source/read-sends-trusted-paramdef', source.includes("decode: { paramdef: projection") && source.includes('expectedRowDataSize: input.definition.rowDataSize'));
+// Cleanup contract fixture: concurrent reads get independent directories, a
+// transient remove failure retries once, and a persistent filesystem failure
+// becomes a structured warning instead of replacing the read/write result.
+const cleanupRoot = await createSmokeTemporaryDirectory(resolve(tmpdir(), 'soulforge-param-cleanup-smoke-'));
+try {
+    // Child handoffs mirror production's direct param-read-* directories. The
+    // enclosing smoke workspace already owns their restart cleanup.
+    const concurrentDirs = await Promise.all(Array.from({ length: 4 }, async () => {
+        const directory = await mkdtemp(resolve(cleanupRoot, 'param-read-'));
+        await mkdir(resolve(directory, 'payload'), { recursive: true });
+        return directory;
+    }));
+    const concurrentDiagnostics = await Promise.all(concurrentDirs.map((directory) => cleanupParamTempDirectory({
+        stagingRoot: cleanupRoot,
+        tempDirectory: directory,
+        containerPath: resolve(cleanupRoot, 'gameparam.parambnd.dcx')
+    })));
+    check('cleanup/concurrent-independent', concurrentDiagnostics.every((diagnostic) => diagnostic === undefined));
+    const leftovers = await Promise.all(concurrentDirs.map(async (directory) => {
+        try {
+            await access(directory);
+            return true;
+        }
+        catch {
+            return false;
+        }
+    }));
+    check('cleanup/concurrent-no-leftovers', leftovers.every((exists) => !exists));
+    const retryDirectory = await mkdtemp(resolve(cleanupRoot, 'param-read-'));
+    let retryAttempts = 0;
+    const retryDiagnostic = await cleanupParamTempDirectory({
+        stagingRoot: cleanupRoot,
+        tempDirectory: retryDirectory,
+        containerPath: resolve(cleanupRoot, 'gameparam.parambnd.dcx'),
+        remove: async (path) => {
+            retryAttempts += 1;
+            if (retryAttempts === 1)
+                throw Object.assign(new Error('sharing violation'), { code: 'EBUSY' });
+            await rm(path, { recursive: true, force: true });
+        }
+    });
+    check('cleanup/transient-retry', retryDiagnostic === undefined && retryAttempts === 2, JSON.stringify({ retryDiagnostic, retryAttempts }));
+    const failureDirectory = await mkdtemp(resolve(cleanupRoot, 'param-read-'));
+    let failureAttempts = 0;
+    const failureDiagnostic = await cleanupParamTempDirectory({
+        stagingRoot: cleanupRoot,
+        tempDirectory: failureDirectory,
+        containerPath: resolve(cleanupRoot, 'gameparam.parambnd.dcx'),
+        remove: async () => {
+            failureAttempts += 1;
+            throw Object.assign(new Error('access denied'), { code: 'EACCES' });
+        }
+    });
+    check('cleanup/persistent-failure-structured', failureDiagnostic?.code === 'PARAM_TEMP_CLEANUP_FAILED' && failureAttempts === 2, JSON.stringify({ failureDiagnostic, failureAttempts }));
+    check('cleanup/persistent-failure-does-not-throw', failureDiagnostic?.severity === 'warning');
+    const rejected = await cleanupParamTempDirectory({
+        stagingRoot: cleanupRoot,
+        tempDirectory: resolve(cleanupRoot, '..', 'param-read-outside'),
+        containerPath: resolve(cleanupRoot, 'gameparam.parambnd.dcx')
+    });
+    check('cleanup/path-boundary', rejected?.code === 'PARAM_TEMP_CLEANUP_PATH_REJECTED', JSON.stringify(rejected));
+    check('cleanup/path-boundary-no-io', !(await stat(cleanupRoot).then(() => false).catch(() => true)));
+    const nestedDirectory = resolve(failureDirectory, 'workspace');
+    await mkdir(nestedDirectory);
+    let rejectedRemoveAttempts = 0;
+    const nestedRejected = await cleanupParamTempDirectory({
+        stagingRoot: cleanupRoot,
+        tempDirectory: nestedDirectory,
+        containerPath: resolve(cleanupRoot, 'gameparam.parambnd.dcx'),
+        remove: async () => { rejectedRemoveAttempts += 1; }
+    });
+    check('cleanup/nested-path-rejected', nestedRejected?.code === 'PARAM_TEMP_CLEANUP_PATH_REJECTED');
+    check('cleanup/nested-path-no-io', rejectedRemoveAttempts === 0 && await stat(nestedDirectory).then(() => true));
+}
+finally {
+    await rm(cleanupRoot, { recursive: true, force: true });
+}
+const registry = createDefaultToolRegistry();
+const listed = new Set(registry.list().map((tool) => tool.name));
+check('tools/registered-read', listed.has('read_param_fields'));
+check('tools/registered-mutate', listed.has('mutate_param_fields'));
+check('tools/registered-create', listed.has('create_param_row'));
+const emptyContext = { mode: 'plan', workspaceIndex: new WorkspaceIndex('ws') };
+const planDenied = await registry.run('mutate_param_fields', { edits: [{ table: 'Bullet', rowId: 1, fieldId: 'life', value: 2 }] }, emptyContext);
+check('permission/plan-denies-mutate', planDenied.ok === false && planDenied.error?.code === 'TOOL_PERMISSION_DENIED', JSON.stringify(planDenied.error));
+const nativeBlocked = await registry.run('propose_text_patch', {
+    targetUri: 'file://param/gameparam/gameparam.parambnd.dcx',
+    targetPath: 'param/gameparam/gameparam.parambnd.dcx',
+    newText: 'nope'
+}, { mode: 'normal', workspaceIndex: new WorkspaceIndex('ws') });
+check('propose/rejects-parambnd', nativeBlocked.ok === false && nativeBlocked.error?.code === 'USE_NATIVE_EDIT_FACADE', JSON.stringify(nativeBlocked.error));
+const emevdBlocked = await registry.run('propose_text_patch', {
+    targetUri: 'file://event/common.emevd.dcx',
+    targetPath: 'event/common.emevd.dcx',
+    newText: 'nope'
+}, { mode: 'normal', workspaceIndex: new WorkspaceIndex('ws') });
+check('propose/rejects-emevd', emevdBlocked.ok === false && emevdBlocked.error?.code === 'USE_NATIVE_EDIT_FACADE', JSON.stringify(emevdBlocked.error));
+if (failures.length > 0) {
+    console.error(JSON.stringify({ ok: false, checks, failures }, null, 2));
+    process.exitCode = 1;
+}
+else {
+    console.log(JSON.stringify({ ok: true, checks, message: 'containerParamEdit facade smoke passed' }, null, 2));
+}
+//# sourceMappingURL=runContainerParamEditSmoke.js.map

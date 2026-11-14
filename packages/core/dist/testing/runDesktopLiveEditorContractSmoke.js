@@ -1,0 +1,123 @@
+/**
+ * 桌面编辑后端契约：IPC 通道、preload 桥接与 staging 写链。
+ *
+ * renderer UI 已从仓库移除，因此这里不再断言任何 React 组件接线；保留的
+ * 全部断言针对仍存在的后端契约（ipc.ts / preload / bridgeStaging），它们
+ * 是任何未来 renderer 都必须遵守的安全与分页边界。
+ *
+ * 分页 channel 是否注册、preload 是否暴露分页方法这两组断言已迁到真实执行
+ * 观测门禁 `npm run test:desktop-ipc-contract`。
+ */
+import { readdirSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+function main() {
+    const root = resolve('../..');
+    const preload = readFileSync(resolve(root, 'apps/desktop/src/preload/index.ts'), 'utf8');
+    // The composition root delegates domain handlers to split modules. Keep the
+    // static contract anchored to the actual production handler sources instead
+    // of silently checking only the root registration file.
+    const ipcRoot = resolve(root, 'apps/desktop/src/main/ipc');
+    const ipc = [
+        readFileSync(resolve(root, 'apps/desktop/src/main/ipc.ts'), 'utf8'),
+        readFileSync(resolve(root, 'apps/desktop/src/main/workspaceStorage.ts'), 'utf8'),
+        ...readdirSync(ipcRoot)
+            .filter((name) => name.endsWith('.ts') && !name.endsWith('.test.ts'))
+            .sort()
+            .map((name) => readFileSync(resolve(ipcRoot, name), 'utf8')),
+        ...readdirSync(resolve(root, 'apps/desktop/src/main/services'))
+            .filter((name) => name.endsWith('.ts') && !name.endsWith('.test.ts'))
+            .sort()
+            .map((name) => readFileSync(resolve(root, 'apps/desktop/src/main/services', name), 'utf8'))
+    ].join('\n');
+    const rawResourceService = readFileSync(resolve(root, 'apps/desktop/src/main/services/rawResourceService.ts'), 'utf8');
+    const paramService = readFileSync(resolve(root, 'apps/desktop/src/main/services/paramService.ts'), 'utf8');
+    const bridgeStaging = readFileSync(resolve(root, 'packages/core/src/editing/bridgeStaging.ts'), 'utf8');
+    // 分页 channel 注册与 preload 分页方法接线：见 test:desktop-ipc-contract
+    // （真实观测 main 注册表与 preload invoke 目标，含双向对账）。
+    // Bounded access must be one shared windowing authority (hard constraint 17):
+    // ipc must consume the shared normalizePageWindow from core and not keep a
+    // private copy that could drift from the acceptance smoke.
+    if (!ipc.includes('normalizePageWindow'))
+        throw new Error('ipc missing shared normalizePageWindow');
+    if (ipc.includes('function normalizePageWindow')) {
+        throw new Error('ipc must not define a private normalizePageWindow');
+    }
+    // Real-corpus PARAM reads must stay payload-null-safe, and must actually
+    // fetch the current page's row bytes.
+    //
+    // 注意：原注释说「不传 commandOptions 会让 C# 抛 InvalidOperationException」，
+    // 2026-08-10 实测**已不成立**（BridgeCommandService 的 optionsIsObject 守卫，
+    // commit 5b669c6 修掉了那个 crash）。保留显式空对象仍然对，但理由是不依赖
+    // 对端缺省行为，不是躲一个已经不存在的异常。
+    if (!/commandOptions:\s*loadAll\s*\?\s*\{\s*includeAllPayloads:\s*true\s*\}\s*:\s*\{\s*\}/.test(paramService)
+        || !paramService.includes('typeof row.dataBase64 === \'string\'')) {
+        throw new Error('readParamPage must send empty default commandOptions, explicitly request load-all payloads, and stay payload-null-safe');
+    }
+    /*
+     * 当页字节读取不可缺失。
+     *
+     * 为什么单独立一条：C# 的载荷门控按**页**算 —— 页行数超过 rowPreviewLimit
+     * （默认 32）或页字节数超限时，整页 dataBase64 全为 null。全表读取等于
+     * 「页大小 = 总行数」，必然超限，于是每一行都没有字节。实测同一个
+     * BEHAVIOR_PARAM_ST（5275 行 × 32 字节）：commandOptions {} 返回 5275 行
+     * 且 payloadsIncluded=false，全部无字节；{rowPage:0,rowPageSize:20} 则 20 行
+     * 全部带字节。ATK_PARAM_ST（464 字节宽）与 EQUIP_PARAM_WEAPON_ST（632 字节宽）
+     * 在 pageSize 20 下同样带字节。
+     *
+     * 没有字节，字段解码 / 行复制 / 字段编辑全部拿不到输入 —— 这正是「PARAM 页面
+     * 打得开但改不了」的成因之一。
+     *
+     * 上面那条 `commandOptions: {}` 判据无法覆盖本形态：删掉当页读取后它照样命中，
+     * 因为全表读取仍在。所以必须另立一条锚在 rowPageSize 下传上，否则这次修复
+     * 可以被静默移除而门禁全绿。
+     */
+    if (!paramService.includes('rowPage: bridgePage') || !paramService.includes('rowPageSize: window.size')) {
+        throw new Error('readParamPage must fetch the current page row bytes with explicit rowPage/rowPageSize;'
+            + ' a full-table read alone never carries payloads (C# gates payloads per page)');
+    }
+    // RAW service owns native container routing. This guard stays anchored to the
+    // current bounded header route; raw-domain-service.fixture exercises read,
+    // refusal, and narrowly permitted SFBN fallback behavior without cloning the parser.
+    const nativeBnd4Route = "command: kind === 'bnd4' ? 'list-bnd4-entries' : 'read-dcx-document'";
+    for (const token of [
+        'async function probeNativeContainerKind',
+        "magic === 'BND3' || magic === 'BND4'",
+        "return magic === 'DCX\\0' ? 'dcx' : null;",
+        nativeBnd4Route,
+        "code: 'BND3_NATIVE_ENUMERATION_UNSUPPORTED'",
+        "code: 'BND_NATIVE_ENUMERATION_COMPLETE'"
+    ]) {
+        if (!rawResourceService.includes(token))
+            throw new Error(`RAW container routing contract missing ${token}`);
+    }
+    if (!ipc.includes("game: 'sekiro'")
+        || !ipc.includes('rejectNonSekiroNativeWrite(sourceUri, file)')) {
+        throw new Error('native semantic writes must fail closed outside the Sekiro adaptation');
+    }
+    if (!ipc.includes('stageBridgeOutput')
+        || !ipc.includes('stagingRoot: storage.stagingRoot')
+        || !bridgeStaging.includes('writableRoots: [input.stagingRoot]')
+        || !bridgeStaging.includes('rm(stagingDirectory, { recursive: true, force: true })')
+        || ipc.includes('mkdtemp(join(tmpdir()')
+        || bridgeStaging.includes('mkdtemp(join(tmpdir()')) {
+        throw new Error('desktop native writers must reuse core staging with stable app-data roots and cleanup');
+    }
+    if (!ipc.includes("join(dirname(app.getPath('appData')), 'Local', 'SoulForge')")) {
+        throw new Error('workspace databases and recovery data must use LOCALAPPDATA on Windows');
+    }
+    console.log(JSON.stringify({
+        ok: true,
+        message: 'Desktop backend contract passed for split IPC/services, preload and staging.',
+        paths: [
+            'Sekiro-only native write gate',
+            'stable LOCALAPPDATA staging root with cleanup',
+            'shared normalizePageWindow windowing authority (no private copy)',
+            'readParamPage: payload-null-safe rows + explicit per-page row byte fetch (rowPage/rowPageSize)',
+            'listContainerChildrenPage: bounded header routing (loose BND4 native list, DCX document, BND3 unavailable)'
+        ],
+        rendererUi: 'verified-by-separate-renderer-suites',
+        delegatedTo: 'npm run test:desktop-ipc-contract（分页 channel 注册 / preload 分页方法接线 / 双向对账，真实执行观测）'
+    }, null, 2));
+}
+main();
+//# sourceMappingURL=runDesktopLiveEditorContractSmoke.js.map

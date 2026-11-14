@@ -1,0 +1,36 @@
+/** Empty native models have no renderable geometry to verify. */
+export function summarizeFlverValidation(reports) {
+    const samples = reports.map(report => {
+        const empty = report.emptyMeshIndices ?? [];
+        const validEmpty = Array.isArray(empty) && new Set(empty).size === empty.length
+            && empty.every(index => Number.isInteger(index) && index >= 0 && index < report.meshCount);
+        const complete = validEmpty && report.meshesChecked === report.meshCount
+            && report.meshesOk + empty.length === report.meshCount;
+        const validationStatus = report.decodeFailures.length ? 'failed'
+            : !validEmpty ? 'unverified'
+                : report.meshCount === 0 || (complete && report.meshesOk === 0) ? 'empty'
+                    : complete ? 'passed'
+                        : 'unverified';
+        return { ...report, validationStatus };
+    });
+    const counts = { passed: 0, failed: 0, empty: 0, unverified: 0 };
+    for (const sample of samples)
+        counts[sample.validationStatus] += 1;
+    const ok = counts.failed === 0 && counts.unverified === 0 && counts.passed > 0;
+    const status = counts.failed > 0 ? 'failed' : ok ? 'verified' : 'unverified';
+    // Empty-topology meshes are classified, never decoded: they complete a sample's coverage
+    // but are not verified meshes, so the summary counts them apart.
+    const meshCounts = {
+        total: reports.reduce((sum, report) => sum + report.meshCount, 0),
+        verified: samples.filter(sample => sample.validationStatus === 'passed').reduce((sum, sample) => sum + sample.meshesOk, 0),
+        emptyTopology: samples.reduce((sum, sample) => sum + (sample.emptyMeshIndices?.length ?? 0), 0)
+    };
+    return { ok, status, counts, meshCounts, samples, independentReferenceVerified: false,
+        evidenceScope: 'native structural self-consistency; independent-reference correctness requires separate field reports',
+        failures: samples.filter(sample => sample.validationStatus === 'failed'),
+        message: ok ? `FLVER 多样本原生验证通过（${counts.passed} verified samples, ${meshCounts.verified} verified meshes; ${meshCounts.emptyTopology} empty-topology meshes; ${counts.empty} empty samples）`
+            : counts.failed ? `FLVER 多样本原生验证失败（${counts.failed} failed samples; ${counts.empty} empty samples）`
+                : `FLVER 多样本未验证（${counts.empty} empty samples; ${counts.unverified} incomplete samples）`
+    };
+}
+//# sourceMappingURL=flverValidationReport.js.map

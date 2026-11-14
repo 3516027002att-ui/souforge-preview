@@ -1,0 +1,247 @@
+/**
+ * Shared session for Agent / CLI native edits (PARAM, later FMG / EMEVD).
+ *
+ * Opens an overlay workspace, mints the same shape of confirmation receipt
+ * the workbench uses, and exposes a RawReplaceCommitPort over saveRawReplace.
+ * Callers must still stage bytes through Bridge writers; this module does
+ * not parse native formats.
+ */
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { mkdir, readFile, stat } from 'node:fs/promises';
+import { basename, dirname, extname, join, relative, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { MemoryOperationLogStore } from '../patch/operationLog.js';
+import { createConfirmationReceipt } from '../patch/writerContract.js';
+import { openWorkspaceSession, assertNoExternalEmedfOptions } from '../workspace/workspaceSession.js';
+import { saveRawReplace } from './saveRawResource.js';
+import { localApplicationDataDirectory } from '../storage/localApplicationData.js';
+export function nativeEditSessionFromContext(input) {
+    const stagingRoot = input.stagingRoot ?? join(input.backupBaseDir, '..', 'staging');
+    const commitPort = {
+        commit: (request) => {
+            const confirmation = request.confirmation
+                ?? input.confirmation
+                ?? mintNativeEditReceipt(request.file.sourceUri, request.title);
+            return saveRawReplace({
+                file: request.file,
+                expectedHash: request.expectedHash,
+                newContentBase64: request.newContentBase64,
+                title: request.title,
+                confirmation,
+                session: input.session,
+                operationLog: input.operationLog,
+                backupBaseDir: input.backupBaseDir,
+                recoveryDir: input.recoveryDir
+            });
+        }
+    };
+    const overlayParent = dirname(input.session.layers.overlayRoot);
+    const probedOodleRoot = input.session.layers.baseRoot
+        ?? (existsSync(join(overlayParent, 'oo2core_6_win64.dll')) || existsSync(join(overlayParent, 'sekiro.exe')) ? overlayParent : undefined);
+    const hostHandles = new Map();
+    return {
+        session: input.session,
+        operationLog: input.operationLog,
+        stagingRoot,
+        backupBaseDir: input.backupBaseDir,
+        recoveryDir: input.recoveryDir,
+        ...(probedOodleRoot ? { oodleRuntimeRoot: probedOodleRoot } : {}),
+        ...(input.confirmationPort ? { confirmationPort: input.confirmationPort } : {}),
+        commitPort,
+        allowedRoots: () => [
+            input.session.layers.overlayRoot,
+            ...(input.session.layers.baseRoot ? [input.session.layers.baseRoot] : []),
+            ...(probedOodleRoot ? [probedOodleRoot] : []),
+            join(input.backupBaseDir, '..')
+        ],
+        mintReceipt: mintNativeEditReceipt,
+        indexFile: (absolutePath, kind) => indexOverlayFile(input.session, absolutePath, kind),
+        registerReadHandle: (entry) => {
+            hostHandles.set(entry.handle, entry);
+        },
+        resolveReadHandle: (handle) => hostHandles.get(handle),
+        verifyReadCoverage: (handle, requiredFields) => {
+            const entry = hostHandles.get(handle);
+            if (!entry) {
+                return {
+                    ok: false,
+                    code: 'NATIVE_HANDLE_UNKNOWN',
+                    message: `Native handle '${handle}' is unknown to host session table.`
+                };
+            }
+            const missing = requiredFields.filter((req) => !entry.readFields.has(req));
+            if (missing.length > 0) {
+                return {
+                    ok: false,
+                    code: 'READ_COVERAGE_INCOMPLETE',
+                    message: `Precondition failed for handle '${handle}': missing required read coverage for fields: ${missing.join(', ')}.`
+                };
+            }
+            return { ok: true };
+        }
+    };
+}
+export async function openNativeEditSession(options) {
+    assertNoExternalEmedfOptions(options);
+    const overlayRoot = resolve(options.overlayRoot);
+    const session = await openWorkspaceSession({
+        overlayRoot,
+        ...(options.baseRoot ? { baseRoot: resolve(options.baseRoot) } : {}),
+        game: options.game ?? 'sekiro'
+    });
+    const storage = cliStoragePaths(session.meta.workspaceId);
+    await mkdir(storage.stagingRoot, { recursive: true });
+    await mkdir(storage.backupBaseDir, { recursive: true });
+    await mkdir(storage.recoveryDir, { recursive: true });
+    const operationLog = options.operationLog ?? new MemoryOperationLogStore();
+    const oodleRuntimeRoot = session.layers.baseRoot;
+    const commitPort = {
+        commit: (input) => {
+            const confirmation = input.confirmation ?? mintNativeEditReceipt(input.file.sourceUri, input.title);
+            return saveRawReplace({
+                file: input.file,
+                expectedHash: input.expectedHash,
+                newContentBase64: input.newContentBase64,
+                title: input.title,
+                confirmation,
+                session,
+                operationLog,
+                backupBaseDir: storage.backupBaseDir,
+                recoveryDir: storage.recoveryDir
+            });
+        }
+    };
+    const hostHandles = new Map();
+    return {
+        session,
+        operationLog,
+        stagingRoot: storage.stagingRoot,
+        backupBaseDir: storage.backupBaseDir,
+        recoveryDir: storage.recoveryDir,
+        ...(oodleRuntimeRoot ? { oodleRuntimeRoot } : {}),
+        commitPort,
+        allowedRoots: () => [
+            overlayRoot,
+            ...(session.layers.baseRoot ? [session.layers.baseRoot] : []),
+            storage.root
+        ],
+        mintReceipt: mintNativeEditReceipt,
+        indexFile: (absolutePath, kind) => indexOverlayFile(session, absolutePath, kind),
+        registerReadHandle: (entry) => {
+            hostHandles.set(entry.handle, entry);
+        },
+        resolveReadHandle: (handle) => hostHandles.get(handle),
+        verifyReadCoverage: (handle, requiredFields) => {
+            const entry = hostHandles.get(handle);
+            if (!entry) {
+                return {
+                    ok: false,
+                    code: 'NATIVE_HANDLE_UNKNOWN',
+                    message: `Native handle '${handle}' is unknown to host session table.`
+                };
+            }
+            const missing = requiredFields.filter((req) => !entry.readFields.has(req));
+            if (missing.length > 0) {
+                return {
+                    ok: false,
+                    code: 'READ_COVERAGE_INCOMPLETE',
+                    message: `Precondition failed for handle '${handle}': missing required read coverage for fields: ${missing.join(', ')}.`
+                };
+            }
+            return { ok: true };
+        }
+    };
+}
+export function mintNativeEditReceipt(sourceUri, title) {
+    return createConfirmationReceipt({
+        subjects: [
+            'CLI_NATIVE_EDIT',
+            sourceUri,
+            'ALL_RISKS',
+            `TITLE:${title}`,
+            `NONCE:${randomUUID()}`
+        ],
+        riskLevel: 'high',
+        sourceUri,
+        note: '本机 CLI / Agent 门面显式调用，经 Patch Engine 提交'
+    });
+}
+export async function indexOverlayFile(session, absolutePath, kind = 'param') {
+    const resolved = resolve(absolutePath);
+    const writable = session.resolveWritablePath(resolved);
+    if (!writable.ok || !writable.absolutePath) {
+        throw Object.assign(new Error(writable.diagnostics[0]?.message ?? '路径不在打开的工作区内。'), {
+            code: writable.diagnostics[0]?.code ?? 'WRITE_PATH_REJECTED',
+            diagnostics: writable.diagnostics
+        });
+    }
+    const info = await stat(resolved);
+    const relativePath = relative(session.layers.overlayRoot, resolved).replaceAll('\\', '/');
+    const compound = compoundExtensionOf(resolved);
+    return {
+        id: `file:${relativePath}`,
+        workspaceId: session.meta.workspaceId,
+        sourceUri: pathToFileURL(resolved).href,
+        sourcePath: relativePath,
+        game: session.meta.game,
+        resourceKind: kind,
+        parseStatus: 'parsed',
+        diagnostics: [],
+        absolutePath: resolved,
+        relativePath,
+        extension: extname(resolved),
+        compoundExtension: compound,
+        formatKind: formatKindOf(compound),
+        formatLabel: formatLabelOf(compound),
+        size: info.size,
+        mtimeMs: info.mtimeMs,
+        sha256: await sha256File(resolved)
+    };
+}
+function cliStoragePaths(workspaceId) {
+    const key = createHash('sha256').update(workspaceId).digest('hex').slice(0, 24);
+    const local = localApplicationDataDirectory();
+    const root = join(local, 'SoulForge', 'cli-workspaces', key);
+    return {
+        root,
+        backupBaseDir: join(root, 'backups'),
+        recoveryDir: join(root, 'recovery'),
+        stagingRoot: join(root, 'staging')
+    };
+}
+function compoundExtensionOf(filePath) {
+    const name = basename(filePath).toLowerCase();
+    const markers = ['.parambnd.dcx', '.msgbnd.dcx', '.emevd.dcx', '.dcx'];
+    for (const marker of markers) {
+        if (name.endsWith(marker))
+            return marker;
+    }
+    return extname(filePath).toLowerCase();
+}
+function formatKindOf(compound) {
+    if (compound.includes('param'))
+        return 'param';
+    if (compound.includes('emevd'))
+        return 'emevd';
+    if (compound.includes('fmg') || compound.includes('msgbnd'))
+        return 'fmg';
+    if (compound.endsWith('.dcx'))
+        return 'dcx';
+    if (compound.endsWith('.bnd'))
+        return 'bnd';
+    return 'unknown';
+}
+function formatLabelOf(compound) {
+    if (compound.includes('param'))
+        return 'PARAM BND';
+    if (compound.includes('emevd'))
+        return 'EMEVD';
+    if (compound.includes('msgbnd') || compound.includes('fmg'))
+        return 'FMG';
+    return compound.toUpperCase();
+}
+async function sha256File(path) {
+    return createHash('sha256').update(await readFile(path)).digest('hex');
+}
+//# sourceMappingURL=nativeEditSession.js.map

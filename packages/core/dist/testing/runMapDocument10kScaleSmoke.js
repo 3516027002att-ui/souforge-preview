@@ -1,0 +1,242 @@
+import assert from 'node:assert/strict';
+import { buildCanonicalMapDocument, exportMapSceneForBlender, importBlenderDeltaToTransaction, MapSceneGraph, validateMapTransaction } from '@soulforge/shared';
+export async function runMapDocument10kScaleSmoke() {
+    console.log('[Smoke] Testing 10k Scale MapDocument & SceneGraph...');
+    const totalParts = 8000;
+    const totalRegions = 1500;
+    const totalEvents = 500;
+    const parts = Array.from({ length: totalParts }, (_, i) => ({
+        name: `c1050_${i.toString().padStart(4, '0')}`,
+        typeId: 0,
+        modelIndex: i % 10,
+        posX: i * 1.5,
+        posY: 0,
+        posZ: i * 2.0,
+        rotX: 0,
+        rotY: (i % 360),
+        rotZ: 0,
+        scaleX: 1,
+        scaleY: 1,
+        scaleZ: 1,
+        entityId: 100000 + i,
+        nativeOffset: 0x1000 + i * 0x80
+    }));
+    const regions = Array.from({ length: totalRegions }, (_, i) => ({
+        name: `Region_${i.toString().padStart(4, '0')}`,
+        typeId: 1,
+        posX: i * 10,
+        posY: 0,
+        posZ: i * 10,
+        entityId: 200000 + i,
+        nativeOffset: 0x500000 + i * 0x40
+    }));
+    const events = Array.from({ length: totalEvents }, (_, i) => ({
+        name: `Event_${i.toString().padStart(4, '0')}`,
+        typeId: 2,
+        eventId: 300000 + i,
+        nativeOffset: 0x600000 + i * 0x30
+    }));
+    const models = Array.from({ length: 10 }, (_, i) => ({
+        name: `m000${i.toString().padStart(3, '0')}`,
+        typeId: 0,
+        nativeOffset: 0x700000 + i * 0x20
+    }));
+    const doc = buildCanonicalMapDocument({
+        sourceUri: 'game://map/m10_00_00_00.msb.dcx',
+        sourcePath: 'map/m10_00_00_00.msb.dcx',
+        game: 'sekiro',
+        revision: 'rev_10k_init',
+        models,
+        parts,
+        regions,
+        events
+    });
+    assert.equal(doc.parts.length, totalParts, '10k parts must be loaded completely without truncation');
+    assert.equal(doc.regions.length, totalRegions, '1500 regions must be loaded');
+    assert.equal(doc.events.length, totalEvents, '500 events must be loaded');
+    assert.equal(doc.models.length, 10, '10 models must be loaded');
+    assert.equal(doc.totalEntityCount, totalParts + totalRegions + totalEvents + 10, 'Total entities must match');
+    const graph = new MapSceneGraph(doc);
+    // Test query parts sharing model
+    const partsWithModel0 = graph.queryPartsByModel('m000000');
+    assert.equal(partsWithModel0.length, totalParts / 10, 'Parts sharing model m000000 must match');
+    assert.equal(partsWithModel0[0]?.modelName, 'm000000');
+    // Test find entity by stableKey and address
+    const firstPart = doc.parts[0];
+    assert.equal(graph.findEntity(firstPart.stableKey), firstPart);
+    assert.equal(graph.findEntity(firstPart.address), firstPart);
+    console.log('[Smoke] Testing duplicate display-name native identity...');
+    const duplicateDoc = buildCanonicalMapDocument({
+        sourceUri: 'game://map/duplicate-name.msb.dcx',
+        sourcePath: 'map/duplicate-name.msb.dcx',
+        game: 'sekiro',
+        revision: 'rev_duplicate_name',
+        models: [{ name: 'm000000', typeId: 0, nativeOffset: 0x10 }],
+        parts: [
+            { name: 'dup_part', typeId: 0, modelIndex: 0, posX: 1, posY: 0, posZ: 0, nativeOffset: 0x100 },
+            { name: 'dup_part', typeId: 0, modelIndex: 0, posX: 2, posY: 0, posZ: 0, nativeOffset: 0x200 }
+        ]
+    });
+    const duplicateGraph = new MapSceneGraph(duplicateDoc);
+    assert.equal(duplicateGraph.findPart('dup_part'), undefined, 'duplicate display names must not select a write target');
+    // The bug this guards: an entity's own address used to be non-unique, so resolving the address
+    // printed by the document itself answered "ambiguous". Address is now the identity.
+    const byOwnAddress = duplicateGraph.resolveEntity(duplicateDoc.parts[0].address);
+    assert.equal(byOwnAddress.ok, true, 'a duplicated name must carry a unique address');
+    if (byOwnAddress.ok)
+        assert.equal(byOwnAddress.entity.nativeOffset, 0x100);
+    assert.notEqual(duplicateDoc.parts[0].address, duplicateDoc.parts[1].address, 'duplicate addresses must differ');
+    // The old name-only form stays resolvable but is ambiguous, not silently the first duplicate.
+    // (`<mapId>#name` needs a real mAA_BB_CC_DD block id; this fixture's mapId is synthetic, so the
+    // saved map-address form is covered by the native MSB read tests.)
+    const ambiguousName = duplicateGraph.resolveEntity('dup_part');
+    assert.equal(ambiguousName.ok, false, 'duplicate name form must be reported ambiguous');
+    if (!ambiguousName.ok) {
+        assert.equal(ambiguousName.code, 'MAP_ENTITY_AMBIGUOUS');
+        assert.equal(ambiguousName.candidates.length, 2);
+    }
+    const secondByNative = duplicateGraph.resolveNativeIdentity({
+        family: 'part',
+        nativeOffset: duplicateDoc.parts[1].nativeOffset,
+        expectedName: 'dup_part'
+    });
+    assert.equal(secondByNative.ok, true, 'nativeOffset plus expectedName must resolve the intended duplicate');
+    if (secondByNative.ok)
+        assert.equal(secondByNative.entity.nativeOffset, 0x200);
+    console.log('[Smoke] Testing validateMapTransaction...');
+    const validTx = {
+        id: 'tx-1',
+        mapId: 'm10_00_00_00',
+        baseRevision: 'rev_10k_init',
+        description: 'Move part',
+        author: 'agent',
+        operations: [
+            { kind: 'set_transform', target: firstPart.stableKey, position: [15, 0, 15] }
+        ],
+        timestamp: Date.now()
+    };
+    const validResult = validateMapTransaction(doc, validTx);
+    assert.equal(validResult.valid, true, 'Valid transaction must pass validation');
+    // Test invalid target transaction
+    const invalidTx = {
+        id: 'tx-2',
+        mapId: 'm10_00_00_00',
+        baseRevision: 'rev_10k_init',
+        description: 'Move non-existent part',
+        author: 'agent',
+        operations: [
+            { kind: 'set_transform', target: 'part:non_existent', position: [0, 0, 0] }
+        ],
+        timestamp: Date.now()
+    };
+    const invalidResult = validateMapTransaction(doc, invalidTx);
+    assert.equal(invalidResult.valid, false, 'Invalid transaction must be rejected');
+    assert.equal(invalidResult.diagnostics[0]?.code, 'MAP_ENTITY_NOT_FOUND');
+    console.log('[Smoke] Testing Blender export & import round-trip...');
+    const exported = exportMapSceneForBlender(doc);
+    assert.equal(exported.schemaVersion, 1);
+    assert.equal(exported.mapId, 'm10_00_00_00');
+    assert.equal(exported.revision, 'rev_10k_init');
+    assert.equal(exported.objects.length, totalParts + totalRegions);
+    const delta = {
+        schemaVersion: 1,
+        mapId: 'm10_00_00_00',
+        baseRevision: 'rev_10k_init',
+        importedAt: new Date().toISOString(),
+        mutations: [
+            {
+                stableKey: firstPart.stableKey,
+                action: 'modify',
+                family: 'part',
+                nativeOffset: firstPart.nativeOffset,
+                position: [120, 10, -30],
+                rotation: [0, 180, 0]
+            }
+        ]
+    };
+    const importResult = importBlenderDeltaToTransaction(doc, delta);
+    assert.equal(importResult.ok, true, 'Blender import must succeed for matching revision');
+    if (importResult.ok) {
+        assert.equal(importResult.transaction.author, 'blender');
+        assert.equal(importResult.transaction.operations.length, 1);
+    }
+    const emptyModifyDelta = {
+        schemaVersion: 1,
+        mapId: 'm10_00_00_00',
+        baseRevision: 'rev_10k_init',
+        importedAt: new Date().toISOString(),
+        mutations: [{
+                stableKey: firstPart.stableKey,
+                action: 'modify',
+                family: 'part',
+                nativeOffset: firstPart.nativeOffset
+            }]
+    };
+    const emptyModifyResult = importBlenderDeltaToTransaction(doc, emptyModifyDelta);
+    assert.equal(emptyModifyResult.ok, false, 'Blender modify without fields must fail closed');
+    if (!emptyModifyResult.ok)
+        assert.match(emptyModifyResult.error, /MAP_MODIFY_EMPTY/);
+    // Test duplicate delta rejection (Section 4: fake duplicate capability removed)
+    const duplicateDelta = {
+        schemaVersion: 1,
+        mapId: 'm10_00_00_00',
+        baseRevision: 'rev_10k_init',
+        importedAt: new Date().toISOString(),
+        mutations: [
+            {
+                stableKey: firstPart.stableKey,
+                action: 'duplicate',
+                position: [200, 10, -30]
+            }
+        ]
+    };
+    const duplicateResult = importBlenderDeltaToTransaction(doc, duplicateDelta);
+    assert.equal(duplicateResult.ok, false, 'Duplicate delta must be rejected as unsupported');
+    if (!duplicateResult.ok) {
+        assert.match(duplicateResult.error, /MAP_DUPLICATE_UNSUPPORTED/, 'Error must contain MAP_DUPLICATE_UNSUPPORTED code');
+    }
+    const createDelta = {
+        schemaVersion: 1,
+        mapId: 'm10_00_00_00',
+        baseRevision: 'rev_10k_init',
+        importedAt: new Date().toISOString(),
+        mutations: [
+            {
+                stableKey: 'part:m10_00_00_00:new-part',
+                action: 'create',
+                name: 'new-part'
+            }
+        ]
+    };
+    const createResult = importBlenderDeltaToTransaction(doc, createDelta);
+    assert.equal(createResult.ok, false, 'Blender create must fail closed');
+    if (!createResult.ok) {
+        assert.match(createResult.error, /MAP_CREATE_UNSUPPORTED/, 'Create error must be explicit');
+    }
+    // Test multi-op batch transaction validation (Section 3: single batch atomic commit)
+    const batchTx = {
+        id: 'tx-batch-1',
+        mapId: 'm10_00_00_00',
+        baseRevision: 'rev_10k_init',
+        description: 'Batch edit multiple parts and regions',
+        author: 'human',
+        operations: [
+            { kind: 'set_transform', target: doc.parts[0].stableKey, position: [10, 20, 30] },
+            { kind: 'set_transform', target: doc.parts[1].stableKey, rotation: [0, 90, 0] },
+            { kind: 'set_transform', target: doc.regions[0].stableKey, position: [100, 0, 100] },
+            { kind: 'change_model', target: doc.parts[2].stableKey, newModelName: 'm000001' },
+            { kind: 'delete', target: doc.parts[3].stableKey }
+        ],
+        timestamp: Date.now()
+    };
+    const batchValidation = validateMapTransaction(doc, batchTx);
+    assert.equal(batchValidation.valid, true, 'Batch transaction with 5 diverse operations must pass validation');
+    console.log('[Smoke] 10k Scale MapDocument & SceneGraph Smoke PASSED.');
+}
+if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('runMapDocument10kScaleSmoke.js')) {
+    runMapDocument10kScaleSmoke().catch((err) => {
+        console.error(err);
+        process.exit(1);
+    });
+}
+//# sourceMappingURL=runMapDocument10kScaleSmoke.js.map

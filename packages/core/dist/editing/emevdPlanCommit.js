@@ -1,0 +1,718 @@
+/**
+ * Convert a DSL-compiled EmevdMutationPlan into Bridge-native batch mutations,
+ * stage via Bridge, and commit through PatchIR + WorkspaceTransaction.
+ *
+ * DSL plan → Bridge mutations → staged bytes → file_replace PatchIR → commit → re-read.
+ * Unknown instructions, opaque tails and layer variants are never re-encoded
+ * (the DSL compiler already rejects them as read-only).
+ */
+import { createHash, randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
+import { mutateInstructionArg } from '../emevd/emedfSchema.js';
+import { decodeStrictBase64 } from '../util/base64.js';
+import { formatEmevdAnchor } from '../emevd/stableIdentity.js';
+import { runBridge } from '../bridge/runBridge.js';
+import { stageBridgeOutput } from './bridgeStaging.js';
+import { commitEmevdBatchViaBridge } from './emevdBridgeCommit.js';
+import { createPatchIr } from '../patch-engine/patchIr.js';
+import { executePatchIrThroughTransaction } from '../patch/durablePatchCommit.js';
+/**
+ * Convert an EmevdMutationPlan into an ordered array of Bridge-native mutations.
+ *
+ * Ordering guarantees（C# writer 顺序应用，全局指令下标会随结构变化漂移）:
+ * 0. set_instruction_args — 全局下标，必须在任何结构改动之前（按原始文档计算）
+ * 1. delete_instruction — 事件内下标，同一事件内按下标降序
+ * 2. insert_event（add_event 空事件，供后续 insert 引用）
+ * 3. insert_instruction — 事件内下标（删除已应用后的列表），同一事件内升序
+ * 4. delete_event — 放在指令级改动之后（其指令已随事件一起消失）
+ * 5. set_rest_behavior
+ * 6. update_id — 最后（改的是其他 mutation 引用的 eventId）
+ */
+export function planToBridgeMutations(plan, document, registry) {
+    const eventByAnchor = new Map();
+    const instructionGlobalIndex = new Map();
+    let globalIndex = 0;
+    for (const event of document.events) {
+        if (event.anchor) {
+            eventByAnchor.set(formatEmevdAnchor('event', event.anchor), event);
+        }
+        for (const instruction of event.instructions) {
+            if (instruction.anchor) {
+                instructionGlobalIndex.set(formatEmevdAnchor('instruction', instruction.anchor), globalIndex);
+            }
+            globalIndex++;
+        }
+    }
+    const argGroups = new Map();
+    const deleteInstructionMutations = [];
+    const insertEventIds = new Set();
+    const insertEventMutations = [];
+    const insertInstructionMutations = [];
+    const deleteEventMutations = [];
+    const restBehaviorMutations = [];
+    const setEventParametersMutations = [];
+    const eventIdMutations = [];
+    for (const operation of plan.operations) {
+        if (operation.kind === 'set_instruction_arg') {
+            const existing = argGroups.get(operation.instructionAnchor);
+            if (existing) {
+                existing.changes.push({ argument: operation.argument, value: operation.after });
+            }
+            else {
+                const bound = findInstructionByAnchor(document, operation.instructionAnchor);
+                if (!bound) {
+                    return {
+                        ok: false,
+                        code: 'EMEVD_PLAN_ANCHOR_NOT_FOUND',
+                        message: `指令锚 ${operation.instructionAnchor} 在文档中未找到。`
+                    };
+                }
+                argGroups.set(operation.instructionAnchor, {
+                    instructionAnchor: operation.instructionAnchor,
+                    bank: bound.bank,
+                    id: bound.id,
+                    argsBase64: bound.argsBase64,
+                    changes: [{ argument: operation.argument, value: operation.after }]
+                });
+            }
+        }
+        else if (operation.kind === 'set_event_rest_behavior') {
+            const event = eventByAnchor.get(operation.eventAnchor);
+            if (!event) {
+                return {
+                    ok: false,
+                    code: 'EMEVD_PLAN_ANCHOR_NOT_FOUND',
+                    message: `事件锚 ${operation.eventAnchor} 在文档中未找到。`
+                };
+            }
+            restBehaviorMutations.push({
+                mutation: {
+                    kind: 'set_rest_behavior',
+                    eventId: event.eventId,
+                    restBehavior: operation.after
+                },
+                order: 5
+            });
+        }
+        else if (operation.kind === 'set_event_parameters') {
+            let eventId;
+            if (operation.eventAnchor === '' && insertEventIds.has(operation.eventId)) {
+                eventId = operation.eventId;
+            }
+            else {
+                const event = eventByAnchor.get(operation.eventAnchor);
+                if (!event) {
+                    return {
+                        ok: false,
+                        code: 'EMEVD_PLAN_ANCHOR_NOT_FOUND',
+                        message: `事件锚 ${operation.eventAnchor} 在文档中未找到。`
+                    };
+                }
+                eventId = event.eventId;
+            }
+            setEventParametersMutations.push({
+                mutation: {
+                    kind: 'set_event_parameters',
+                    eventId,
+                    parameters: operation.parameters
+                },
+                order: 5.5
+            });
+        }
+        else if (operation.kind === 'set_event_id') {
+            const event = eventByAnchor.get(operation.eventAnchor);
+            if (!event) {
+                return {
+                    ok: false,
+                    code: 'EMEVD_PLAN_ANCHOR_NOT_FOUND',
+                    message: `事件锚 ${operation.eventAnchor} 在文档中未找到。`
+                };
+            }
+            eventIdMutations.push({
+                mutation: {
+                    kind: 'update_id',
+                    eventId: event.eventId,
+                    newEventId: operation.after
+                },
+                order: 6
+            });
+        }
+        else if (operation.kind === 'delete_instruction') {
+            const event = eventByAnchor.get(operation.eventAnchor);
+            if (!event) {
+                return {
+                    ok: false,
+                    code: 'EMEVD_PLAN_ANCHOR_NOT_FOUND',
+                    message: `事件锚 ${operation.eventAnchor} 在文档中未找到。`
+                };
+            }
+            deleteInstructionMutations.push({
+                mutation: {
+                    kind: 'delete_instruction',
+                    eventId: operation.eventId,
+                    instructionIndex: operation.index
+                },
+                order: 1,
+                // 同一事件内按下标降序，前面的删除不会移动后面的下标。
+                tiebreak: operation.eventId * 1_000_000 - operation.index
+            });
+        }
+        else if (operation.kind === 'insert_event') {
+            if (eventIdExists(document, operation.eventId) || insertEventIds.has(operation.eventId)) {
+                return {
+                    ok: false,
+                    code: 'EMEVD_PLAN_EVENT_ID_DUPLICATE',
+                    message: `新增事件 ID ${operation.eventId} 已存在。`
+                };
+            }
+            insertEventIds.add(operation.eventId);
+            insertEventMutations.push({
+                mutation: {
+                    kind: 'add_event',
+                    newEventId: operation.eventId,
+                    restBehavior: operation.restBehavior
+                },
+                order: 2
+            });
+        }
+        else if (operation.kind === 'insert_instruction') {
+            if (operation.eventAnchor !== '' && !eventByAnchor.has(operation.eventAnchor)) {
+                return {
+                    ok: false,
+                    code: 'EMEVD_PLAN_ANCHOR_NOT_FOUND',
+                    message: `事件锚 ${operation.eventAnchor} 在文档中未找到。`
+                };
+            }
+            if (operation.eventAnchor === '' && !insertEventIds.has(operation.eventId)) {
+                return {
+                    ok: false,
+                    code: 'EMEVD_PLAN_EVENT_NOT_PLANNED',
+                    message: `insert_instruction 引用的事件 ${operation.eventId} 不在计划的新增事件里。`
+                };
+            }
+            insertInstructionMutations.push({
+                mutation: {
+                    kind: 'insert_instruction',
+                    eventId: operation.eventId,
+                    instructionIndex: operation.index,
+                    bank: operation.bank,
+                    id: operation.id,
+                    argsBase64: operation.argsBase64
+                },
+                order: 3,
+                // 同一事件内按下标升序，依序插入。
+                tiebreak: operation.eventId * 1_000_000 + operation.index
+            });
+        }
+        else if (operation.kind === 'delete_event') {
+            const event = eventByAnchor.get(operation.eventAnchor);
+            if (!event) {
+                return {
+                    ok: false,
+                    code: 'EMEVD_PLAN_ANCHOR_NOT_FOUND',
+                    message: `事件锚 ${operation.eventAnchor} 在文档中未找到。`
+                };
+            }
+            deleteEventMutations.push({
+                mutation: { kind: 'delete_event', eventId: operation.eventId },
+                order: 4
+            });
+        }
+    }
+    const instructionMutations = [];
+    for (const group of argGroups.values()) {
+        const globalIdx = instructionGlobalIndex.get(group.instructionAnchor);
+        if (globalIdx === undefined) {
+            return {
+                ok: false,
+                code: 'EMEVD_PLAN_ANCHOR_NOT_FOUND',
+                message: `指令锚 ${group.instructionAnchor} 没有全局索引。`
+            };
+        }
+        let currentArgs;
+        try {
+            currentArgs = decodeStrictBase64(group.argsBase64, { allowEmpty: true });
+        }
+        catch {
+            return {
+                ok: false,
+                code: 'EMEVD_PLAN_ARGS_DECODE_FAILED',
+                message: `指令 ${group.instructionAnchor} 的 argsBase64 无效。`
+            };
+        }
+        for (const change of group.changes) {
+            const result = mutateInstructionArg(registry, group.bank, group.id, currentArgs, change.argument, change.value);
+            if (!result.ok) {
+                return {
+                    ok: false,
+                    code: result.code,
+                    message: result.message
+                };
+            }
+            currentArgs = result.args;
+        }
+        instructionMutations.push({
+            mutation: {
+                kind: 'set_instruction_args',
+                instructionIndex: globalIdx,
+                argsBase64: currentArgs.toString('base64')
+            },
+            order: 0
+        });
+    }
+    const all = [
+        ...instructionMutations,
+        ...deleteInstructionMutations,
+        ...insertEventMutations,
+        ...insertInstructionMutations,
+        ...deleteEventMutations,
+        ...restBehaviorMutations,
+        ...setEventParametersMutations,
+        ...eventIdMutations
+    ]
+        .sort((a, b) => a.order - b.order || (a.tiebreak ?? 0) - (b.tiebreak ?? 0))
+        .map((item) => item.mutation);
+    return { ok: true, mutations: all };
+}
+function eventIdExists(document, eventId) {
+    return document.events.some((event) => event.eventId === eventId);
+}
+/**
+ * Stage an EmevdMutationPlan via Bridge as a single atomic batch write
+ * (the C# writer applies the `mutations` array and re-reads the output).
+ * Staging only: bytes are returned for the caller to commit via Patch Engine.
+ */
+export async function stageEmevdPlanViaBridge(request) {
+    const converted = planToBridgeMutations(request.plan, request.document, request.registry);
+    if (!converted.ok) {
+        return {
+            ok: false,
+            mutationCount: 0,
+            diagnostics: [{ severity: 'error', code: converted.code, message: converted.message }]
+        };
+    }
+    if (converted.mutations.length === 0) {
+        return {
+            ok: true,
+            mutationCount: 0,
+            diagnostics: [{
+                    severity: 'info',
+                    code: 'EMEVD_PLAN_EMPTY',
+                    message: '计划中没有需要执行的 mutation。'
+                }]
+        };
+    }
+    const staged = await stageBridgeOutput({
+        stagingRoot: request.stagingRoot,
+        prefix: 'emevd-plan',
+        fileName: 'plan-mutated.emevd',
+        allowedRoots: (stagingRoot) => uniqueRoots([...request.allowedRoots, stagingRoot]),
+        write: (context) => commitEmevdBatchViaBridge({
+            sourcePath: request.sourcePath,
+            outputPath: context.outputPath,
+            expectedDocumentHash: request.expectedDocumentHash,
+            allowedRoots: context.allowedRoots,
+            writableRoots: context.writableRoots,
+            mutations: converted.mutations,
+            ...(request.timeoutMs !== undefined ? { timeoutMs: request.timeoutMs } : {}),
+            ...(request.oodleRuntimeRoot !== undefined ? { oodleRuntimeRoot: request.oodleRuntimeRoot } : {})
+        })
+    });
+    if (!staged.ok) {
+        const bridgeDiagnostics = staged.result?.diagnostics ?? [];
+        const allDiagnostics = [
+            ...bridgeDiagnostics.map((d) => ({ severity: d.severity, code: d.code, message: d.message })),
+            ...staged.diagnostics.map((d) => ({ severity: d.severity, code: d.code, message: d.message }))
+        ];
+        if (allDiagnostics.length === 0) {
+            allDiagnostics.push({
+                severity: 'error',
+                code: 'BRIDGE_STAGING_FAILED',
+                message: 'EMEVD 计划经 Bridge 暂存失败，且未返回结构化诊断。'
+            });
+        }
+        return { ok: false, mutationCount: converted.mutations.length, diagnostics: allDiagnostics };
+    }
+    return {
+        ok: true,
+        bytes: staged.bytes,
+        result: staged.result,
+        ...(staged.result.sourceFormat === 'dcx' || staged.result.sourceFormat === 'emevd'
+            ? { sourceFormat: staged.result.sourceFormat }
+            : {}),
+        ...(staged.result.outerFileHash ? { outerFileHash: staged.result.outerFileHash } : {}),
+        ...(staged.result.payloadHash ? { payloadHash: staged.result.payloadHash } : {}),
+        mutationCount: converted.mutations.length,
+        diagnostics: staged.result.diagnostics.map((d) => ({
+            severity: d.severity,
+            code: d.code,
+            message: d.message
+        }))
+    };
+}
+/**
+ * Build the file_replace PatchIR for Bridge-staged EMEVD bytes.
+ * expectedHash precondition prevents committing over a stale source.
+ */
+export function buildEmevdFileReplacePatch(input) {
+    const op = {
+        id: randomUUID(),
+        kind: 'file_replace',
+        targetUri: input.targetUri,
+        targetPath: input.targetPath,
+        resourceKind: 'event',
+        newContentBase64: input.stagedBytes.toString('base64'),
+        expectedHash: input.expectedHash,
+        preconditions: [
+            {
+                type: 'overlay_writable',
+                description: 'Target must be inside writable overlay',
+                targetUri: input.targetUri
+            },
+            {
+                type: 'content_hash',
+                description: 'Expected content hash before replace',
+                expectedHash: input.expectedHash,
+                targetUri: input.targetUri
+            }
+        ],
+        validatorRequirements: [
+            { validatorId: 'whole_file_replace', scope: 'before_staging', required: true },
+            { validatorId: 'file_risk', scope: 'before_staging', required: true },
+            { validatorId: 'binary_roundtrip', scope: 'staged_output', required: false },
+            { validatorId: 'binary_roundtrip', scope: 'after_commit', required: false }
+        ],
+        riskLevel: 'high',
+        requiresConfirmation: true,
+        metadata: {
+            nativeFormatAuthority: true,
+            requiresConfirmation: true,
+            emevdPlanBatch: true
+        }
+    };
+    return createPatchIr({
+        workspaceId: input.workspaceId,
+        title: input.title,
+        author: 'user',
+        operations: [op]
+    });
+}
+/**
+ * After-commit Bridge reopen validator for EMEVD file_replace commits
+ * (EVENT-30C). Reopens the committed resource natively and fails — which makes
+ * the WorkspaceTransaction roll the file back to its before-image — when the
+ * committed bytes cannot be re-parsed, the semantic roundtrip is not identical,
+ * or the committed file bytes diverge from the staged artifact. This is the
+ * "Bridge reopen → event/instruction semantic verify → rollback" boundary of
+ * the outer-chain write flow.
+ */
+export function createEmevdReopenValidator(input) {
+    return {
+        validatorId: 'emevd_reopen_verify',
+        targetResourceKinds: ['event'],
+        validationScope: ['after_commit'],
+        async validateAfterCommit(commit) {
+            const diagnostics = [];
+            for (const committedPath of commit.committedPaths) {
+                const op = commit.operations.find((operation) => operation.targetPath === committedPath);
+                const envelope = await runBridge({
+                    command: 'read-emevd-document',
+                    filePath: committedPath,
+                    allowedRoots: input.allowedRoots,
+                    timeoutMs: input.timeoutMs ?? 120_000
+                });
+                if (envelope.parseStatus === 'failed') {
+                    diagnostics.push({
+                        severity: 'error',
+                        code: 'EMEVD_REOPEN_FAILED',
+                        message: '提交后 Bridge 无法重开已提交的 EMEVD 资源。',
+                        ...(op?.targetUri !== undefined ? { targetUri: op.targetUri } : {}),
+                        details: { targetPath: committedPath, bridgeDiagnostics: envelope.diagnostics }
+                    });
+                    continue;
+                }
+                if (envelope.data?.roundTrip?.semanticIdentical !== true) {
+                    diagnostics.push({
+                        severity: 'error',
+                        code: 'EMEVD_REOPEN_SEMANTIC_FAILED',
+                        message: '提交后重开语义往返不一致。',
+                        ...(op?.targetUri !== undefined ? { targetUri: op.targetUri } : {}),
+                        details: { targetPath: committedPath }
+                    });
+                }
+                if (op?.kind === 'file_replace' && op.newContentBase64) {
+                    let committedBytes;
+                    try {
+                        committedBytes = await readFile(committedPath);
+                    }
+                    catch (error) {
+                        diagnostics.push({
+                            severity: 'error',
+                            code: 'EMEVD_REOPEN_READ_FAILED',
+                            message: error instanceof Error ? error.message : '提交后无法读取文件。',
+                            targetUri: op.targetUri,
+                            details: { targetPath: committedPath }
+                        });
+                        continue;
+                    }
+                    const expected = createHash('sha256')
+                        .update(Buffer.from(op.newContentBase64, 'base64'))
+                        .digest('hex');
+                    const actual = createHash('sha256').update(committedBytes).digest('hex');
+                    if (actual !== expected) {
+                        diagnostics.push({
+                            severity: 'error',
+                            code: 'EMEVD_REOPEN_BYTE_MISMATCH',
+                            message: '提交后文件字节与暂存产物不一致。',
+                            targetUri: op.targetUri,
+                            details: { targetPath: committedPath, expected, actual }
+                        });
+                    }
+                }
+            }
+            return {
+                ok: diagnostics.length === 0,
+                diagnostics,
+                scope: 'after_commit',
+                validatorId: 'emevd_reopen_verify'
+            };
+        }
+    };
+}
+/**
+ * Production EMEVD DSL plan commit:
+ * Bridge batch staging → file_replace PatchIR → WorkspaceTransaction
+ * (stage/validate/commit/backup/re-read/rollback) → Bridge re-read of the
+ * committed file for byte-level consistency.
+ */
+export async function commitEmevdPlanViaPatchEngine(request) {
+    const staged = await stageEmevdPlanViaBridge(request);
+    if (!staged.ok) {
+        return { ok: false, mutationCount: staged.mutationCount, diagnostics: staged.diagnostics };
+    }
+    if (!staged.bytes || !staged.result) {
+        if (staged.mutationCount === 0) {
+            // No-op plan: nothing to stage or commit.
+            return { ok: true, mutationCount: 0, diagnostics: staged.diagnostics };
+        }
+        return {
+            ok: false,
+            mutationCount: staged.mutationCount,
+            diagnostics: [{
+                    severity: 'error',
+                    code: 'EMEVD_PLAN_STAGE_BYTES_MISSING',
+                    message: 'Bridge 暂存成功但未返回输出字节，拒绝提交。'
+                }]
+        };
+    }
+    const patch = buildEmevdFileReplacePatch({
+        workspaceId: request.workspaceId,
+        title: request.title ?? `EMEVD DSL plan ${request.plan.planFingerprint.slice(0, 8)}`,
+        targetUri: request.targetUri ?? pathToFileURL(request.sourcePath).toString(),
+        targetPath: request.sourcePath,
+        stagedBytes: staged.bytes,
+        // 修改目标始终是 outer source resource：磁盘上是 .dcx 时，file_replace 的
+        // content_hash 前置必须按 outer 文件字节（outerFileHash）比对，而不是 payload 哈希。
+        expectedHash: request.expectedOuterFileHash ?? request.expectedDocumentHash
+    });
+    const committed = await executePatchIrThroughTransaction(patch, {
+        workspaceRoot: request.workspaceRoot,
+        ...(request.session !== undefined ? { session: request.session } : {}),
+        ...(request.operationLog !== undefined ? { operationLog: request.operationLog } : {}),
+        ...(request.backupBaseDir !== undefined ? { backupBaseDir: request.backupBaseDir } : {}),
+        ...(request.recoveryDir !== undefined ? { recoveryDir: request.recoveryDir } : {}),
+        // Bridge reopen 验证挂在事务的 after_commit 上：重开失败即自动回滚到 before-image。
+        appendValidators: [createEmevdReopenValidator({
+                allowedRoots: request.allowedRoots,
+                ...(request.timeoutMs !== undefined ? { timeoutMs: request.timeoutMs } : {})
+            })]
+    });
+    const commitDiagnostics = committed.diagnostics.map((d) => ({ severity: d.severity, code: d.code, message: d.message }));
+    if (committed.changedFiles.length === 0) {
+        return {
+            ok: false,
+            transactionStatus: 'not_committed',
+            ...(staged.result.outputHash ? { outputHash: staged.result.outputHash } : {}),
+            ...(staged.result.payloadHash ? { payloadHash: staged.result.payloadHash } : {}),
+            ...(staged.result.sourceFormat === 'dcx' ? { sourceFormat: staged.result.sourceFormat } : {}),
+            ...(staged.result.outerFileHash ? { outerFileHash: staged.result.outerFileHash } : {}),
+            mutationCount: staged.mutationCount,
+            opId: committed.opId,
+            diagnostics: commitDiagnostics
+        };
+    }
+    return finalizeEmevdPostCommitRead({
+        sourcePath: request.sourcePath,
+        allowedRoots: request.allowedRoots,
+        ...(request.timeoutMs !== undefined ? { timeoutMs: request.timeoutMs } : {}),
+        ...(request.oodleRuntimeRoot !== undefined ? { oodleRuntimeRoot: request.oodleRuntimeRoot } : {}),
+        sourceFormat: staged.result.sourceFormat ?? 'emevd',
+        expectedOutputHash: staged.result.outputHash ?? '',
+        ...(staged.result.payloadHash ? { expectedPayloadHash: staged.result.payloadHash } : {}),
+        opId: committed.opId,
+        ...(committed.changedFiles[0] !== undefined ? { committedPath: committed.changedFiles[0] } : {}),
+        ...(staged.result.outputHash ? { outputHash: staged.result.outputHash } : {}),
+        ...(staged.result.payloadHash ? { payloadHash: staged.result.payloadHash } : {}),
+        ...(staged.result.outerFileHash ? { outerFileHash: staged.result.outerFileHash } : {}),
+        ...(staged.result.eventCount !== undefined ? { eventCount: staged.result.eventCount } : {}),
+        ...(staged.result.instructionCount !== undefined
+            ? { instructionCount: staged.result.instructionCount }
+            : {}),
+        mutationCount: staged.mutationCount,
+        commitDiagnostics,
+        read: () => runBridge({
+            command: 'read-emevd-document',
+            filePath: request.sourcePath,
+            allowedRoots: request.allowedRoots,
+            timeoutMs: request.timeoutMs ?? 120_000,
+            ...(request.oodleRuntimeRoot !== undefined ? { oodleRuntimeRoot: request.oodleRuntimeRoot } : {})
+        })
+    });
+}
+/**
+ * Perform the independent post-commit native read and preserve the durable
+ * receipt even when that read throws. The reader seam is production-bound to
+ * runBridge by the caller and is injectable only for deterministic tests.
+ */
+export async function finalizeEmevdPostCommitRead(input) {
+    const read = input.read ?? (() => runBridge({
+        command: 'read-emevd-document',
+        filePath: input.sourcePath,
+        allowedRoots: input.allowedRoots,
+        timeoutMs: input.timeoutMs ?? 120_000,
+        ...(input.oodleRuntimeRoot !== undefined ? { oodleRuntimeRoot: input.oodleRuntimeRoot } : {})
+    }));
+    let reRead;
+    try {
+        reRead = await read();
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const diagnostic = {
+            severity: 'error',
+            code: 'EMEVD_REREAD_EXCEPTION',
+            message: `提交后重读异常：${message}`
+        };
+        return {
+            ok: false,
+            transactionStatus: 'committed',
+            nativeVerification: {
+                status: 'failed',
+                code: diagnostic.code,
+                message: diagnostic.message
+            },
+            ...(input.outputHash ? { outputHash: input.outputHash } : {}),
+            ...(input.payloadHash ? { payloadHash: input.payloadHash } : {}),
+            ...(input.sourceFormat === 'dcx' && input.outerFileHash ? { outerFileHash: input.outerFileHash } : {}),
+            ...(input.eventCount !== undefined ? { eventCount: input.eventCount } : {}),
+            ...(input.instructionCount !== undefined ? { instructionCount: input.instructionCount } : {}),
+            mutationCount: input.mutationCount,
+            opId: input.opId,
+            ...(input.committedPath ? { committedPath: input.committedPath } : {}),
+            diagnostics: [...input.commitDiagnostics, diagnostic]
+        };
+    }
+    const reReadSourceHash = reRead.data?.sourceHash ?? '';
+    const reReadOuterHash = reRead.data?.outerFileHash ?? '';
+    const actualOutputHash = (input.sourceFormat === 'dcx' ? reReadOuterHash : reReadSourceHash).toLowerCase();
+    const byteConsistent = reRead.parseStatus !== 'failed'
+        && actualOutputHash === input.expectedOutputHash.toLowerCase()
+        && (input.sourceFormat !== 'dcx'
+            || !reReadSourceHash
+            || reReadSourceHash.toLowerCase() === (input.expectedPayloadHash ?? '').toLowerCase());
+    const semanticIdentical = reRead.data?.roundTrip?.semanticIdentical === true;
+    const reReadOk = byteConsistent && semanticIdentical;
+    const reReadReport = {
+        ok: reReadOk,
+        outputHash: input.sourceFormat === 'dcx' ? reReadOuterHash : reReadSourceHash,
+        ...(reReadSourceHash ? { sourceHash: reReadSourceHash } : {}),
+        ...(reReadOuterHash ? { outerFileHash: reReadOuterHash } : {}),
+        eventCount: reRead.data?.eventCount ?? 0,
+        instructionCount: reRead.data?.instructionCount ?? 0,
+        semanticIdentical,
+        byteConsistent
+    };
+    const diagnostics = [
+        ...input.commitDiagnostics,
+        ...(reReadOk
+            ? [{
+                    severity: 'info',
+                    code: 'EMEVD_REREAD_VERIFIED',
+                    message: '提交后重读通过：字节一致且语义往返一致。'
+                }]
+            : [{
+                    severity: 'error',
+                    code: 'EMEVD_REREAD_FAILED',
+                    message: reRead.parseStatus === 'failed'
+                        ? '提交后重读失败：Bridge 无法解析已提交文件。'
+                        : `提交后重读不一致：字节或语义往返未通过（期望 ${input.expectedOutputHash}，实际 ${reReadOuterHash || reReadSourceHash}）。`
+                }])
+    ];
+    const nativeVerification = reReadOk
+        ? {
+            status: 'verified',
+            details: {
+                outputHash: reReadReport.outputHash,
+                sourceHash: reReadSourceHash || undefined,
+                outerFileHash: reReadOuterHash || undefined,
+                eventCount: reReadReport.eventCount,
+                instructionCount: reReadReport.instructionCount,
+                semanticIdentical,
+                byteConsistent
+            }
+        }
+        : {
+            status: 'failed',
+            code: 'EMEVD_REREAD_FAILED',
+            message: diagnostics.find((item) => item.code === 'EMEVD_REREAD_FAILED')?.message
+                ?? '提交后重读未通过。',
+            details: {
+                outputHash: reReadReport.outputHash,
+                sourceHash: reReadSourceHash || undefined,
+                outerFileHash: reReadOuterHash || undefined,
+                eventCount: reReadReport.eventCount,
+                instructionCount: reReadReport.instructionCount,
+                semanticIdentical,
+                byteConsistent
+            }
+        };
+    return {
+        ok: reReadOk,
+        transactionStatus: 'committed',
+        nativeVerification,
+        ...(input.outputHash ? { outputHash: input.outputHash } : {}),
+        ...(input.payloadHash ? { payloadHash: input.payloadHash } : {}),
+        ...(input.sourceFormat === 'dcx' && input.outerFileHash ? { outerFileHash: input.outerFileHash } : {}),
+        ...(input.eventCount !== undefined ? { eventCount: input.eventCount } : {}),
+        ...(input.instructionCount !== undefined ? { instructionCount: input.instructionCount } : {}),
+        mutationCount: input.mutationCount,
+        opId: input.opId,
+        ...(input.committedPath ? { committedPath: input.committedPath } : {}),
+        reRead: reReadReport,
+        diagnostics
+    };
+}
+function uniqueRoots(roots) {
+    const seen = new Set();
+    const result = [];
+    for (const root of roots) {
+        const key = process.platform === 'win32' ? root.toLowerCase() : root;
+        if (seen.has(key))
+            continue;
+        seen.add(key);
+        result.push(root);
+    }
+    return result;
+}
+function findInstructionByAnchor(document, instructionAnchor) {
+    for (const event of document.events) {
+        for (const instruction of event.instructions) {
+            if (instruction.anchor && formatEmevdAnchor('instruction', instruction.anchor) === instructionAnchor) {
+                return { bank: instruction.bank, id: instruction.id, argsBase64: instruction.argsBase64 };
+            }
+        }
+    }
+    return undefined;
+}
+//# sourceMappingURL=emevdPlanCommit.js.map

@@ -1,0 +1,11 @@
+# Per-machine binding. Not tracked: it names absolute paths on one computer.
+binding.md
+
+# Scratch workspaces and run output.
+output/
+tmp/
+*.log
+
+# Editors / OS.
+.DS_Store
+Thumbs.db

@@ -1,0 +1,5 @@
+import { createStandaloneHksHandler } from '../toolRegistrySupport.js';
+export function createReadHksScriptTool() {
+    return { name: 'read_hks_script', description: "Read a standalone .hks/.lua from the opened workspace through validated plaintext or first-party Bridge decoding. By default it returns the whole decoded source when it fits the Agent budget (most scripts do: 2,073 / 36,423 / 506,571 characters min/median/max over a real install), instead of a 2,400-character preview; larger scripts still page losslessly through sourceOffset/sourceLimit/cursor. sourceTextComplete is true only when this page contains the whole text. Returns lossless sourceOffset/sourceLimit/cursor windows and sourceHash. This is read-only source evidence, not runtime verification or write authorization.", permission: 'read', permissionLevel: 'read', inputSchema: { file: 'string', sourceOffset: 'safe-integer?', sourceLimit: 'safe-integer?', cursor: 'string?', expectedSourceHash: 'string?' }, run: createStandaloneHksHandler('read_hks_script') };
+}
+//# sourceMappingURL=read_hks_script.js.map

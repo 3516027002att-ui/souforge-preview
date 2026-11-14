@@ -1,0 +1,112 @@
+import assert from 'node:assert/strict';
+import { sourceTextPage } from '../ai/sourceTextPage.js';
+import { contentSearchPage } from '../ai/contentSearchPage.js';
+import { WorkspaceIndex } from '../indexing/workspaceIndex.js';
+import { resolveEntity } from '../ai/entityResolution.js';
+import { buildNameMatchEdges } from '../references/referenceProviderRegistry.js';
+import { buildParamReferenceEdges } from '../references/paramReferenceProvider.js';
+import { assertCursorPrivacy } from './harness/assertCursorPrivacy.js';
+import { createOpaqueCursor, parseOpaqueCursor } from '@soulforge/shared';
+const original = ('函数("中文 😀", "\\路径");\n').repeat(600);
+let cursor;
+// sourceKey embeds the workspace id (absolute file:// URL): only its digest may reach the wire.
+const privateSourceKey = 'file:///home/alice/private-mod-workspace|file://msg/item.msgbnd.dcx|Title|10';
+for (const domain of ['script', 'fmg']) {
+    const privatePage = sourceTextPage({ text: 'native-text'.repeat(500), sourceKey: privateSourceKey, sourceHash: 'native-child', domain });
+    assert.equal(assertCursorPrivacy(privatePage, [privateSourceKey, '/home/alice', 'private-mod-workspace']), 1);
+    assert.equal(parseOpaqueCursor(privatePage.nextCursor).sessionId, 'source-text-v2');
+    const continued = sourceTextPage({ text: 'native-text'.repeat(500), sourceKey: privateSourceKey, sourceHash: 'native-child', domain, cursor: privatePage.nextCursor });
+    assert.equal(continued.offset, privatePage.returned);
+    assert.throws(() => sourceTextPage({ text: 'native-text'.repeat(500), sourceKey: privateSourceKey + '-other-resource', sourceHash: 'native-child', domain, cursor: privatePage.nextCursor }), { code: 'SOURCE_CURSOR_SCOPE_MISMATCH' });
+    // Unhashed v1 cursors are rejected (not migrated).
+    const legacy = createOpaqueCursor({ ...parseOpaqueCursor(privatePage.nextCursor), sessionId: 'source-text-v1',
+        scope: JSON.stringify({ sourceKey: privateSourceKey, limit: privatePage.limit }) });
+    assert.throws(() => sourceTextPage({ text: 'native-text'.repeat(500), sourceKey: privateSourceKey, sourceHash: 'native-child', domain, cursor: legacy }), (error) => {
+        assert.ok(!String(error).includes('private-mod-workspace'), 'rejection must not echo the decodable path');
+        return error.code === 'SOURCE_CURSOR_SCOPE_MISMATCH';
+    });
+}
+// contentSearchPage: workspace id is a digest on the wire; pre-hash v2 is rejected.
+const privateWorkspace = 'file:///home/alice/private-mod-workspace';
+const privateSearch = { tool: 'search_text_entries', workspaceId: privateWorkspace, search: () => [1, 2, 3], fingerprint: (row) => row };
+const privateSearchFirst = contentSearchPage({ ...privateSearch, input: { query: 'x', limit: 1 } });
+assert.equal(assertCursorPrivacy(privateSearchFirst, [privateWorkspace, '/home/alice', 'private-mod-workspace']), 2);
+assert.deepEqual(contentSearchPage({ ...privateSearch, input: { cursor: privateSearchFirst.nextCursor } }).matches, [2]);
+const preHashSearch = createOpaqueCursor({ ...parseOpaqueCursor(privateSearchFirst.nextCursor), sessionId: 'content-search-v2',
+    scope: JSON.stringify({ workspaceId: privateWorkspace, tool: 'search_text_entries', query: 'x', paramNames: [], limit: 1 }) });
+assert.throws(() => contentSearchPage({ ...privateSearch, input: { cursor: preHashSearch } }), { code: 'SEARCH_CURSOR_SCOPE_MISMATCH' });
+let assembled = '';
+let pages = 0;
+do {
+    const page = sourceTextPage({ text: original, sourceKey: 'workspace:script/ai!/battle.lua', sourceHash: 'native-child', domain: 'script', ...(cursor ? { cursor } : {}) });
+    assert.ok(page.sourceText.length > 0);
+    assert.ok(Buffer.byteLength(JSON.stringify(page.sourceText), 'utf8') <= 3200);
+    assert.equal(page.sourceTextComplete, false);
+    assembled += page.sourceText;
+    cursor = page.nextCursor;
+    pages += 1;
+    assert.ok(pages < 100);
+} while (cursor);
+assert.equal(assembled, original);
+const first = sourceTextPage({ text: original, sourceKey: 'script-a', sourceHash: 'version-a', domain: 'script' });
+assert.ok(first.nextCursor);
+assert.throws(() => sourceTextPage({ text: original, sourceKey: 'script-b', sourceHash: 'version-a', domain: 'script', cursor: first.nextCursor }), { code: 'SOURCE_CURSOR_SCOPE_MISMATCH' });
+assert.throws(() => sourceTextPage({ text: original + 'changed', sourceKey: 'script-a', sourceHash: 'version-a', domain: 'script', cursor: first.nextCursor }), { code: 'STALE_READ_CURSOR' });
+assert.equal(sourceTextPage({ text: '😀', sourceKey: 'script', sourceHash: 'version', domain: 'script', sourceLimit: 1 }).sourceText, '😀');
+assert.equal(sourceTextPage({ text: '', sourceKey: 'script', sourceHash: 'version', domain: 'script' }).sourceTextComplete, true);
+assert.throws(() => sourceTextPage({ text: '😀', sourceKey: 'script', sourceHash: 'version', domain: 'script', sourceOffset: 1 }), { code: 'INVALID_SOURCE_WINDOW' });
+const index = new WorkspaceIndex('content-search-smoke');
+const sourceUri = 'file://param/gameparam/gameparam.parambnd.dcx';
+index.setFiles([{
+        id: 'param-file', workspaceId: 'content-search-smoke', sourcePath: 'param/gameparam/gameparam.parambnd.dcx', parseStatus: 'parsed',
+        sourceUri, relativePath: 'param/gameparam/gameparam.parambnd.dcx', absolutePath: '/mods/param/gameparam/gameparam.parambnd.dcx',
+        game: 'sekiro', resourceKind: 'param', formatKind: 'dcx', formatLabel: 'PARAM', extension: '.dcx',
+        compoundExtension: '.parambnd.dcx', size: 1, mtimeMs: 7, sha256: 'outer-hash', diagnostics: []
+    }]);
+index.upsertParamExport({
+    sourceUri, paramName: 'EquipParamGoods', entryIndex: 39, sourceHash: 'child-hash', outerFileHash: 'outer-hash', sourceRevision: 7,
+    rows: [{ uri: 'param://EquipParamGoods/4400', sourceUri, paramName: 'EquipParamGoods', rowId: 4400, rowName: '葫芦种子',
+            fields: [], sourceHash: 'child-hash', outerFileHash: 'outer-hash', sourceRevision: 7 }]
+});
+const found = await resolveEntity({ index, query: '葫芦种子', domain: 'param' });
+assert.equal(found.candidates.length, 1);
+assert.notEqual(found.candidates[0]?.status, 'stale');
+assert.equal(found.candidates[0]?.candidateId, 'param://EquipParamGoods/4400');
+const nameMatches = buildNameMatchEdges({ ...index.toSymbolBundle(), msgs: [{ entries: [{
+                    uri: 'msg://zhocn/item/name/9801', sourceUri: 'file://msg/zhocn/item.msgbnd.dcx', textId: 9801, text: '葫芦种子'
+                }] }] });
+assert.equal(nameMatches.edges.length, 1);
+assert.equal(nameMatches.edges[0]?.kind, 'name_match');
+assert.equal(nameMatches.edges[0]?.confidence, 'low');
+assert.equal(nameMatches.edges[0]?.toUri, 'msg://zhocn/item/name/9801');
+const nativePathRefs = buildParamReferenceEdges([
+    { ...index.toSymbolBundle().params[0], entryName: 'N:\\authoring\\EquipParamGoods.param', rows: [{
+                ...index.toSymbolBundle().params[0].rows[0], fields: [{ fieldId: 'effect', name: 'effect', type: 's32', value: 10,
+                        refs: [{ param: 'SpEffectParam' }], refsProvenance: 'trusted-metadata' }]
+            }] },
+    { paramName: 'SP_EFFECT_PARAM_ST', entryName: 'N:\\authoring\\SpEffectParam.param', sourceUri, rows: [{
+                uri: 'param://SpEffectParam/10', sourceUri, paramName: 'SpEffectParam', rowId: 10, fields: []
+            }] }
+]);
+assert.equal(nativePathRefs.edges.length, 1);
+assert.equal(nativePathRefs.edges[0]?.toUri, 'param://SpEffectParam/10');
+const searchRows = Array.from({ length: 15 }, (_, id) => ({ id, text: `文本 ${id}` }));
+const searchOptions = {
+    tool: 'search_text_entries', workspaceId: 'content-search-smoke',
+    search: () => searchRows, fingerprint: (row) => row
+};
+let searchCursor;
+const delivered = [];
+do {
+    const page = contentSearchPage({ ...searchOptions, input: searchCursor ? { cursor: searchCursor } : { query: '文本' } });
+    delivered.push(...page.matches.map((item) => item.id));
+    searchCursor = page.nextCursor;
+} while (searchCursor);
+assert.deepEqual(delivered, searchRows.map((item) => item.id));
+const searchFirst = contentSearchPage({ ...searchOptions, input: { query: '文本' } });
+assert.ok(searchFirst.nextCursor);
+assert.throws(() => contentSearchPage({ ...searchOptions, input: { cursor: searchFirst.nextCursor, query: 'other' } }), { code: 'SEARCH_CURSOR_SCOPE_MISMATCH' });
+searchRows[0].text = '变化';
+assert.throws(() => contentSearchPage({ ...searchOptions, input: { cursor: searchFirst.nextCursor } }), { code: 'STALE_READ_CURSOR' });
+console.log(JSON.stringify({ ok: true, suite: 'content-search', sourcePages: pages, searchRows: delivered.length, checks: ['lossless-source-continuation', 'cursor-scope', 'changed-source', 'unicode-boundaries', 'outer-child-hash-identity', 'lossless-search-pages'] }));
+//# sourceMappingURL=runContentSearchSmoke.js.map

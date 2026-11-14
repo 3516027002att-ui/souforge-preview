@@ -1,0 +1,17 @@
+{
+  "name": "soulforge-preview",
+  "version": "0.1.0-preview.1",
+  "private": true,
+  "description": "SoulForge Preview — a read-only and controlled-write workbench for Sekiro modding, packaged as an agent skill.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "soulforge": {
+    "builtAt": "2026-11-14T03:26:43.429Z",
+    "withAgent": false,
+    "bridge": "bridge/SoulForge.Bridge/bin/Release/net10.0/win-x64/publish/SoulForge.Bridge.exe",
+    "entry": "bin/sfcli.mjs",
+    "skill": "SKILL.md"
+  }
+}

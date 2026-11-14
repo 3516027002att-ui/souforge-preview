@@ -1,0 +1,40 @@
+/**
+ * Read-only projection of the resolved EMEDF registry for editor assistance.
+ *
+ * EventSourceWorkbenchPanel 用 SoulForge 内置 EMEDF 公开指令名做
+ * CodeMirror autocomplete（Ctrl+Space + 输入时）与悬停参数名列表。这里只
+ * 从 `EmedfRegistry` 提取公开字段（name/bank/id/args），不触碰任何
+ * 第三方源码或外部文件。
+ *
+ * 本文件只做纯数据投影，不读写文件系统。
+ */
+/**
+ * 把解析好的 EMEDF registry 投影成补全目录。
+ * 同名指令（不同 bank:id）全部保留，由 UI 决定去重/展示。
+ */
+export function listEmedfCompletionItems(registry) {
+    return registry.instructions.map((item) => ({
+        name: item.name,
+        bank: item.bank,
+        id: item.id,
+        args: item.args.map((arg) => ({
+            name: arg.name,
+            type: arg.type,
+            ...(arg.vararg === true ? { vararg: true } : {}),
+            ...(arg.enumName ? { enumName: arg.enumName } : {}),
+            ...(arg.description ? { description: arg.description } : {}),
+            ...(arg.default !== undefined ? { default: arg.default } : {}),
+            ...(arg.min !== undefined ? { min: arg.min } : {}),
+            ...(arg.max !== undefined ? { max: arg.max } : {}),
+            ...(arg.increment !== undefined ? { increment: arg.increment } : {}),
+            ...(arg.formatString ? { formatString: arg.formatString } : {})
+        }))
+    }));
+}
+export function buildEmedfCompletionCatalog(registry) {
+    return {
+        items: listEmedfCompletionItems(registry),
+        enums: registry.enums ?? {}
+    };
+}
+//# sourceMappingURL=emedfCompletionCatalog.js.map

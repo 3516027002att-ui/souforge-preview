@@ -1,0 +1,484 @@
+/**
+ * 明文脚本条目的判定与源码级编辑输入校验。
+ *
+ * 为什么需要独立一层,而不是复用 scriptContainerEvidence 的分类:
+ *
+ * `classifyScriptEntry` 对所有 `.lua` / `.hks` 一律返回 `lua-bytecode`,明文条目
+ * 只靠 `magicVerified=false` 区分。而那个字段来自**采样**——
+ * `MAGIC_SAMPLE_LIMIT = 12` 按容器顺序只验前 12 条,实测
+ * `543000_battle.lua`(条目索引 222)的 `magicVerified` 是 `undefined`,
+ * 也就是「没验过」。拿一个没验过的条目当明文往里写文本,会把字节码写坏。
+ *
+ * 所以源码级写用的是**按需、逐条、看真实字节**的判定:要写哪个条目就验哪个,
+ * 不接受采样结论,也不接受文件名白名单。文件名可以对得上而内容是字节码
+ * ——mod 作者完全可能把编译产物塞成同名条目。
+ *
+ * ── 实测依据(2026-08-08,本机 Sekiro mod 工作区)──
+ *
+ * 扫 mods/script 下 11 个 luabnd 容器共 1179 个 `.lua`/`.hks` 条目:
+ *   明文 3 个 —— goal_list.lua(21400 B)、543000_battle.lua(53813 B,
+ *   在 aicommon.luabnd.dcx)、801000_battle.lua(120489 B,在
+ *   **m25_00_00_00.luabnd.dcx**);
+ *   字节码 1176 个。
+ * 两类的可打印字节比例**完全不重叠**:明文 1.0000,字节码 0.2029–0.6079。
+ * 判定阈值 0.99 落在这个真实间隔里,不是估计。
+ *
+ * 顺带修正两处既有记录:
+ *   - scope.json 说 801000_battle.lua 在 aicommon.luabnd.dcx —— 实测不在,
+ *     它在 m25_00_00_00.luabnd.dcx;
+ *   - scriptContainerEvidence 头注把 logic_list.lua 举例为明文列表文件 ——
+ *     实测它是 `\x1bLuaP` 字节码(可打印率 0.6121)。
+ *
+ * game 侧 12 个容器在本次扫描里全部读取失败(KRAK/Oodle 需要
+ * oodleRuntimeRoot,未传)。这不影响本模块:源码级写只写当前打开
+ * 工作区的暂存区。结论的覆盖面是 **mod 侧**,不是全量。
+ */
+import { createHash } from 'node:crypto';
+import { createDiagnostic } from '@soulforge/shared';
+/* ------------------------------------------------------------------ */
+/*  判定                                                              */
+/* ------------------------------------------------------------------ */
+/** Havok Script / Lua 字节码签名 `\x1bLua`。 */
+const LUA_SIGNATURE = [0x1b, 0x4c, 0x75, 0x61];
+/**
+ * 明文判定的可打印字节比例阈值。
+ *
+ * 实测明文 1.0000、字节码上限 0.6079,阈值取 0.99 而不是取中点 0.8:
+ * 判定要靠紧明文那一侧。落在 0.6–0.99 之间的东西是「说不清」,而说不清的
+ * 条目必须被拒绝,不能被当成明文写入。
+ */
+export const PLAINTEXT_PRINTABLE_RATIO_THRESHOLD = 0.99;
+/** 判定采样的字节上限。整文件扫一遍对 120 KB 也不慢,但上限让代价可预期。 */
+export const PLAINTEXT_SAMPLE_BYTES = 64 * 1024;
+/**
+ * 按真实字节判定一个条目是否明文。
+ *
+ * 不看文件名、不看扩展名、不用采样结论。文件名可以对得上而内容是字节码。
+ */
+export function classifyPlaintextBytes(bytes) {
+    const totalBytes = bytes.length;
+    const luaBytecodeMagic = totalBytes >= LUA_SIGNATURE.length
+        && LUA_SIGNATURE.every((byte, index) => bytes[index] === byte);
+    // 尾部对齐填充必须先剥掉,再判 NUL。
+    //
+    // 实测三个 action/*nameid.txt **全都**以 NUL 结尾:eventnameid 3 个、
+    // statenameid 5 个、variablenameid 14 个,全部紧贴文件末尾,是容器对齐填充,
+    // 不是内容的一部分。把它们当「内容里有 NUL」会让三个明文条目全被拒。
+    //
+    // 这一处最初写成「采样前 64 KB 判 NUL」,而 eventnameid.txt 有 148048 字节
+    // ——采样只覆盖前 44%,尾部填充落在采样窗口外,于是它「确认为明文」而
+    // variablenameid.txt(13696 字节,整文件在窗口内)被拒。同一批文件得出
+    // 相反结论,原因纯粹是文件大小。NUL 判定因此改为**扫全文件**:
+    // 一个只看开头的判定,对「结尾被塞了东西」这件事完全失明。
+    const paddingBytes = trailingNulCount(bytes);
+    const contentEnd = totalBytes - paddingBytes;
+    const content = bytes.subarray(0, contentEnd);
+    let containsNul = false;
+    for (const byte of content) {
+        if (byte === 0) {
+            containsNul = true;
+            break;
+        }
+    }
+    // 可打印比例仍按采样算(比例是统计量,前 64 KB 足以代表),但基数是
+    // **剥掉填充后**的内容 —— 否则 14 字节填充会把 13696 字节文件的比例拉低。
+    const sample = content.subarray(0, Math.min(PLAINTEXT_SAMPLE_BYTES, content.length));
+    let printable = 0;
+    for (const byte of sample) {
+        if (byte === 9 || byte === 10 || byte === 13 || (byte >= 32 && byte < 127))
+            printable += 1;
+    }
+    const printableRatio = sample.length === 0 ? 0 : printable / sample.length;
+    const detectedEncoding = detectPlaintextEncoding(content);
+    const base = {
+        printableRatio,
+        sampledBytes: sample.length,
+        totalBytes,
+        trailingPaddingBytes: paddingBytes,
+        luaBytecodeMagic,
+        containsNul,
+        detectedEncoding
+    };
+    // 判定顺序按「最明确的拒绝理由优先」:字节码签名是结论性的,
+    // 比例是统计性的。诊断里必须点名是哪一条不满足,否则调用方只知道
+    // 「不是明文」而不知道为什么。
+    if (totalBytes === 0) {
+        return {
+            ...base,
+            isPlaintext: false,
+            code: 'PLAINTEXT_REJECTED_EMPTY',
+            diagnostics: [createDiagnostic({
+                    severity: 'error',
+                    code: 'PLAINTEXT_REJECTED_EMPTY',
+                    message: '条目为空,无法判定是否明文。空条目不接受源码级编辑。'
+                })]
+        };
+    }
+    if (luaBytecodeMagic) {
+        return {
+            ...base,
+            isPlaintext: false,
+            code: 'PLAINTEXT_REJECTED_LUA_BYTECODE_MAGIC',
+            diagnostics: [createDiagnostic({
+                    severity: 'error',
+                    code: 'PLAINTEXT_REJECTED_LUA_BYTECODE_MAGIC',
+                    message: '条目以 \\x1bLua 字节码签名开头,是编译产物。'
+                        + ' 当前 Sekiro HKS 字节码应由上层 first-party Bridge 编译器处理，'
+                        + '本明文编码器不直接改写字节码。'
+                })]
+        };
+    }
+    if (containsNul) {
+        return {
+            ...base,
+            isPlaintext: false,
+            code: 'PLAINTEXT_REJECTED_CONTAINS_NUL',
+            diagnostics: [createDiagnostic({
+                    severity: 'error',
+                    code: 'PLAINTEXT_REJECTED_CONTAINS_NUL',
+                    message: '条目含 NUL 字节,不是文本。按文本改写会破坏内容。'
+                })]
+        };
+    }
+    if (printableRatio < PLAINTEXT_PRINTABLE_RATIO_THRESHOLD) {
+        return {
+            ...base,
+            isPlaintext: false,
+            code: 'PLAINTEXT_REJECTED_LOW_PRINTABLE_RATIO',
+            diagnostics: [createDiagnostic({
+                    severity: 'error',
+                    code: 'PLAINTEXT_REJECTED_LOW_PRINTABLE_RATIO',
+                    message: `可打印字节比例 ${printableRatio.toFixed(4)} 低于阈值 `
+                        + `${PLAINTEXT_PRINTABLE_RATIO_THRESHOLD}。实测明文为 1.0000、`
+                        + '字节码上限 0.6079;落在两者之间的条目判定不明确,一律拒绝——'
+                        + '说不清的内容不该被当作文本写入。'
+                })]
+        };
+    }
+    return {
+        ...base,
+        isPlaintext: true,
+        code: 'PLAINTEXT_CONFIRMED',
+        diagnostics: [createDiagnostic({
+                severity: 'info',
+                code: 'PLAINTEXT_CONFIRMED',
+                message: `条目确认为明文:${totalBytes} 字节,可打印比例 `
+                    + `${printableRatio.toFixed(4)},编码 ${detectedEncoding}。`
+            })]
+    };
+}
+/**
+ * 判定明文条目的编码。
+ *
+ * 顺序有讲究:先看 BOM(确定性),再看是否纯 ASCII(两种编码下字节相同,
+ * 标成 ascii 让调用方知道无需转码),再试 UTF-8 严格解码。UTF-8 严格解码
+ * 失败而字节又都是文本,就按 Shift-JIS 处理 —— 这是本项目语料的实际情况
+ * (action/*nameid.txt),不是通用推断。
+ */
+export function detectPlaintextEncoding(bytes) {
+    if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+        return 'utf8-bom';
+    }
+    let highBit = false;
+    for (const byte of bytes) {
+        if (byte >= 0x80) {
+            highBit = true;
+            break;
+        }
+    }
+    if (!highBit)
+        return 'ascii';
+    try {
+        // fatal 模式下非法序列抛异常，而不是静默替换成 U+FFFD。
+        // 非 fatal 会让 Shift-JIS 内容「解码成功」但内容已被替换符污染。
+        new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        return 'utf8';
+    }
+    catch {
+        // UTF-8 解不了 —— 再验 Shift-JIS 是否真的解得了。
+        //
+        // 第一版直接 `return 'shift_jis'`，把「不是 UTF-8」当成「就是 Shift-JIS」。
+        // 实测 801000_battle.lua 会被这样误判：它混了原版日文与后加的 GBK 中文注释，
+        // 按 Shift-JIS 解码那段得到 U+FFFD，再编回去就永久损坏那些字节。
+        // 误判的代价不是判错一个标签，而是让拒绝理由说了假话。
+        try {
+            new TextDecoder('shift_jis', { fatal: true }).decode(bytes);
+            return 'shift_jis';
+        }
+        catch {
+            return 'mixed-unknown';
+        }
+    }
+}
+/**
+ * 用判定出的编码解码明文条目。
+ *
+ * Shift-JIS 走 TextDecoder('shift_jis')。Node 内置 ICU 支持该标签;
+ * 不支持时抛出而不是退回 UTF-8 —— 静默退回会产出替换符,而那些替换符
+ * 一旦写回就永久替换掉了原文的日文。
+ */
+export function decodePlaintext(bytes, encoding) {
+    if (encoding === 'shift_jis') {
+        return new TextDecoder('shift_jis', { fatal: false }).decode(bytes);
+    }
+    if (encoding === 'utf8-bom') {
+        return new TextDecoder('utf-8').decode(bytes.subarray(3));
+    }
+    return new TextDecoder('utf-8').decode(bytes);
+}
+/**
+ * 统计解码文本的换行形态（CRLF / LF / CR 三档）。
+ *
+ * 渲染器要明示 newline（§10.2），而解码后的 JS 字符串无法直接看出原始
+ * 换行字节——`\r\n` 与 `\n` 在 UI 里都渲染成回车。逐个字符扫：CRLF 成对
+ * 计一次并把 LF 跳过，避免把 `\r\n` 同时计成 cr 与 lf。
+ */
+export function analyzePlaintextLineEndings(text) {
+    let crlf = 0;
+    let lf = 0;
+    let cr = 0;
+    for (let index = 0; index < text.length; index += 1) {
+        const code = text.charCodeAt(index);
+        if (code === 13) {
+            if (text.charCodeAt(index + 1) === 10) {
+                crlf += 1;
+                index += 1;
+            }
+            else {
+                cr += 1;
+            }
+        }
+        else if (code === 10) {
+            lf += 1;
+        }
+    }
+    return { crlf, lf, cr };
+}
+export function encodePlaintext(text, encoding) {
+    const nonAscii = firstNonAsciiIndex(text);
+    if (encoding === 'mixed-unknown') {
+        // 混合编码文件一律拒绝，连纯 ASCII 结果也不放行：解码那一步已经把无法识别的
+        // 字节变成 U+FFFD，此时「结果是纯 ASCII」只说明替换符被后续编辑删掉了，
+        // 写回去仍然丢失原字节。
+        const code = 'PLAINTEXT_MIXED_ENCODING_UNSUPPORTED';
+        const message = '该条目的非 ASCII 字节既不能按 UTF-8 也不能按 Shift-JIS 完整解码'
+            + '（实测 801000_battle.lua 混了原版日文与后加的 GBK 中文注释）。'
+            + ' 整篇解码-编码往返会丢字节，故**文本级**编辑不可用。'
+            + ' 但可以走 `replace-ascii-bytes` 动作做字节级替换：不解码、只在纯 ASCII'
+            + '区域改字节，非 ASCII 字节全程只被复制（实测该文件 2740 行纯 ASCII、'
+            + '仅 6 行含非 ASCII，字节级替换后 52 个非 ASCII 字节完全不变）。'
+            + ' 要写入非 ASCII 内容才必须走整文件替换。';
+        return {
+            ok: false,
+            code,
+            message,
+            diagnostics: [createDiagnostic({ severity: 'error', code, message })]
+        };
+    }
+    if (encoding === 'shift_jis') {
+        if (nonAscii < 0) {
+            // 纯 ASCII 时两种编码字节一致,写回无损。
+            return { ok: true, bytes: new TextEncoder().encode(text), encoding };
+        }
+        // 用由解码器反推出的 CP932 表编码。此前这里直接拒绝所有非 ASCII 结果,
+        // 理由是「没有编码器」——实测那让 3 个 *nameid.txt 完全无法编辑,
+        // 因为它们首行就是日文注释。编码器可以由解码器枚举出来(见 encodeShiftJis)。
+        const encoded = encodeShiftJis(text);
+        if (!encoded.ok) {
+            const code = 'PLAINTEXT_SHIFT_JIS_CHAR_UNMAPPABLE';
+            const message = `新内容第 ${encoded.index} 个字符 ${JSON.stringify(encoded.char)}`
+                + `(U+${(encoded.char.codePointAt(0) ?? 0).toString(16).toUpperCase()})`
+                + ' 在 CP932 里没有对应字节,无法写回 Shift-JIS 条目。'
+                + ' 不做替换:静默换成 ? 会悄悄改变内容。'
+                + ' 请改用 CP932 覆盖范围内的字符,或用整文件替换自行提供字节。';
+            return {
+                ok: false,
+                code,
+                message,
+                diagnostics: [createDiagnostic({ severity: 'error', code, message })]
+            };
+        }
+        return { ok: true, bytes: encoded.bytes, encoding };
+    }
+    if (encoding === 'utf8-bom') {
+        const body = new TextEncoder().encode(text);
+        const withBom = new Uint8Array(body.length + 3);
+        withBom[0] = 0xef;
+        withBom[1] = 0xbb;
+        withBom[2] = 0xbf;
+        withBom.set(body, 3);
+        return { ok: true, bytes: withBom, encoding };
+    }
+    // ascii 与 utf8 都由 UTF-8 编码器覆盖;ascii 条目写入非 ASCII 时编码会
+    // 自然升级为 UTF-8 多字节序列,这对 .lua 明文是安全的(Lua 源码按字节读)。
+    return { ok: true, bytes: new TextEncoder().encode(text), encoding };
+}
+/** 统计紧贴文件末尾的连续 NUL 字节数。 */
+export function trailingNulCount(bytes) {
+    let count = 0;
+    for (let index = bytes.length - 1; index >= 0 && bytes[index] === 0; index -= 1) {
+        count += 1;
+    }
+    return count;
+}
+/* ------------------------------------------------------------------ */
+/*  Shift-JIS 编码器(由解码器反推,不手写码表)                       */
+/* ------------------------------------------------------------------ */
+/**
+ * 反向 CP932 表:码位 → Shift-JIS 字节。
+ *
+ * ── 为什么可以有这张表 ──
+ *
+ * Node 有 `TextDecoder('shift_jis')` 但没有对应的编码器,而本仓库不引 iconv。
+ * 此前的结论是「回写方向没有编码器」,于是 Shift-JIS 条目只允许纯 ASCII 编辑
+ * —— 实测下来那让 3 个 *nameid.txt 完全无法源码级编辑,因为它们首行就有日文。
+ *
+ * 但编码表不必手写:**用解码器枚举出来**。遍历合法的双字节 Shift-JIS 空间,
+ * 逐个解码,把「解得出单一字符」的结果反向记入表中。解码器是权威,反推出的
+ * 表与它天然一致 —— 手抄码表才会有漂移风险(本仓库已记录过 BC7 锚点表
+ * 推导失败 50/64 的教训:能对钉就不要推导)。
+ *
+ * 表按需构建一次(约 8000 个双字节组合,毫秒级),不预生成常量,
+ * 避免往仓库里塞一张无法核对的大表。
+ */
+let reverseShiftJis = null;
+function buildReverseShiftJis() {
+    const table = new Map();
+    const decoder = new TextDecoder('shift_jis', { fatal: true });
+    // CP932 双字节:首字节 0x81–0x9F / 0xE0–0xFC,次字节 0x40–0x7E / 0x80–0xFC。
+    const leadRanges = [[0x81, 0x9f], [0xe0, 0xfc]];
+    const trailRanges = [[0x40, 0x7e], [0x80, 0xfc]];
+    for (const [leadFrom, leadTo] of leadRanges) {
+        for (let lead = leadFrom; lead <= leadTo; lead += 1) {
+            for (const [trailFrom, trailTo] of trailRanges) {
+                for (let trail = trailFrom; trail <= trailTo; trail += 1) {
+                    let decoded;
+                    try {
+                        decoded = decoder.decode(new Uint8Array([lead, trail]));
+                    }
+                    catch {
+                        continue;
+                    }
+                    // 只收单字符映射;多字符结果无法唯一反推。
+                    if ([...decoded].length !== 1)
+                        continue;
+                    if (decoded === '�')
+                        continue;
+                    // 先到先得:同一字符有多个字节表示时保留第一个(与解码器的规范形式一致)。
+                    if (!table.has(decoded))
+                        table.set(decoded, [lead, trail]);
+                }
+            }
+        }
+    }
+    // 单字节半角片假名 0xA1–0xDF。
+    for (let byte = 0xa1; byte <= 0xdf; byte += 1) {
+        try {
+            const decoded = decoder.decode(new Uint8Array([byte]));
+            if ([...decoded].length === 1 && !table.has(decoded)) {
+                table.set(decoded, [byte, -1]);
+            }
+        }
+        catch {
+            // 忽略:不可解码的单字节不进表。
+        }
+    }
+    return table;
+}
+/**
+ * 把文本编成 Shift-JIS 字节。
+ *
+ * 遇到表里没有的字符就失败并点名是哪一个 —— 静默替换成 `?` 会让写回悄悄
+ * 改变内容,而那正是本模块最初为之拒绝写入的风险。
+ */
+export function encodeShiftJis(text) {
+    reverseShiftJis ??= buildReverseShiftJis();
+    const out = [];
+    let index = 0;
+    for (const char of text) {
+        const code = char.codePointAt(0) ?? 0;
+        if (code < 0x80) {
+            out.push(code);
+            index += char.length;
+            continue;
+        }
+        const mapped = reverseShiftJis.get(char);
+        if (!mapped)
+            return { ok: false, char, index };
+        out.push(mapped[0]);
+        if (mapped[1] >= 0)
+            out.push(mapped[1]);
+        index += char.length;
+    }
+    return { ok: true, bytes: new Uint8Array(out) };
+}
+function firstNonAsciiIndex(text) {
+    for (let index = 0; index < text.length; index += 1) {
+        if (text.charCodeAt(index) >= 0x80)
+            return index;
+    }
+    return -1;
+}
+function patchFail(code, message) {
+    return {
+        ok: false,
+        code,
+        message,
+        diagnostics: [createDiagnostic({ severity: 'error', code, message })]
+    };
+}
+/**
+ * 把一组不相交的 range patch 应用于原文。
+ *
+ * 算法保证：
+ * 1. 验证所有 patch 的范围在 [0, originalText.length] 之内且 start <= end；
+ * 2. 严格按 start 排序检测重叠（end > next.start 即拒绝）；
+ * 3. 逐个验证切片的 SHA-256 与 expectedSliceHash 是否一致，不一致即拒绝；
+ * 4. 验证通过后按 start 逆序（从后向前）应用替换，杜绝前序长度变化导致后续 offset 漂移。
+ */
+export function applyRangePatches(originalText, patches) {
+    if (patches.length === 0) {
+        return { ok: true, text: originalText, appliedCount: 0 };
+    }
+    // 1. 基础合法性
+    for (let i = 0; i < patches.length; i++) {
+        const p = patches[i];
+        if (!Number.isSafeInteger(p.start) ||
+            !Number.isSafeInteger(p.end) ||
+            p.start < 0 ||
+            p.end < p.start ||
+            p.end > originalText.length) {
+            return patchFail('SCRIPT_PATCH_RANGE_INVALID', `Range patch [${p.start}, ${p.end}] 超出原文有效范围 [0, ${originalText.length}]。`);
+        }
+    }
+    // 2. 排序与重叠检测
+    const sorted = [...patches].sort((a, b) => a.start - b.start || a.end - b.end);
+    for (let i = 0; i < sorted.length - 1; i++) {
+        const curr = sorted[i];
+        const next = sorted[i + 1];
+        if (curr.end > next.start) {
+            return patchFail('SCRIPT_PATCH_RANGES_OVERLAP', `Range patch 存在重叠：[${curr.start}, ${curr.end}] 与 [${next.start}, ${next.end}]。重叠 patch 必须默认拒绝。`);
+        }
+    }
+    // 3. 切片哈希校验
+    for (let i = 0; i < sorted.length; i++) {
+        const p = sorted[i];
+        const slice = originalText.slice(p.start, p.end);
+        const hash = createHash('sha256').update(slice, 'utf8').digest('hex');
+        if (p.expectedSliceHash.toLowerCase() !== hash.toLowerCase()) {
+            return patchFail('SCRIPT_PATCH_SLICE_HASH_MISMATCH', `Range patch [${p.start}, ${p.end}] 切片哈希不匹配：预期 ${p.expectedSliceHash}，实际 ${hash}。`);
+        }
+    }
+    // 4. 按起点逆序从后往前应用
+    let result = originalText;
+    const reversePatches = [...sorted].sort((a, b) => b.start - a.start);
+    for (const p of reversePatches) {
+        result = result.slice(0, p.start) + p.replacement + result.slice(p.end);
+    }
+    return {
+        ok: true,
+        text: result,
+        appliedCount: reversePatches.length
+    };
+}
+//# sourceMappingURL=plaintextScriptEntry.js.map

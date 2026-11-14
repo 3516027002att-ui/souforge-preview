@@ -1,0 +1,91 @@
+import { createSmokeTemporaryDirectory as mkdtemp } from './harness/smokeWorkspace.js';
+import assert from 'node:assert/strict';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { analyzeWorkspace } from '../pipeline/workspacePipeline.js';
+import { scanWorkspace } from '../workspace/scanWorkspace.js';
+/**
+ * Verifies the staged semantic publish contract without a native fixture:
+ * PARAM must be published before the later EVENT/MAP candidates, and the
+ * final result must still contain every parsed semantic family.
+ */
+const root = await mkdtemp(join(tmpdir(), 'soulforge-pipeline-stage-'));
+try {
+    await Promise.all([
+        mkdir(join(root, 'param'), { recursive: true }),
+        mkdir(join(root, 'event'), { recursive: true }),
+        mkdir(join(root, 'map'), { recursive: true })
+    ]);
+    await writeFile(join(root, 'param', 'mockparam.json'), JSON.stringify({
+        paramName: 'NpcParam',
+        rows: [{ rowId: 50800000, rowName: '鬼刑部', fields: [{ id: 'npcType', value: 1 }] }]
+    }), 'utf8');
+    await writeFile(join(root, 'event', 'mockevent.json'), JSON.stringify({ mapId: 'm10_00_00_00', events: [{ eventId: 100, instructions: [] }] }), 'utf8');
+    await writeFile(join(root, 'map', 'mockmap.json'), JSON.stringify({
+        mapId: 'm10_00_00_00',
+        entities: [{ id: 1, name: '鬼刑部', kind: 'part' }],
+        regions: []
+    }), 'utf8');
+    const stages = [];
+    const result = await analyzeWorkspace({
+        workspaceRoot: root,
+        inspectNativeResources: false,
+        maxFilesToParse: 3,
+        onSemanticIndexReady: ({ index, parsedFiles, total }) => {
+            stages.push({ parsedFiles, total, stats: index.getStats() });
+        }
+    });
+    assert.equal(stages.length, 1, 'semantic stage must be published exactly once');
+    assert.equal(stages[0]?.parsedFiles, 1, 'PARAM must be the first accepted semantic file');
+    assert.equal(stages[0]?.total, 3, 'all three JSON semantic candidates must remain scheduled');
+    assert.equal(stages[0]?.stats.paramRows, 1, 'staged index must expose the PARAM row');
+    assert.equal(stages[0]?.stats.events, 0, 'EVENT must not precede the PARAM stage');
+    assert.equal(stages[0]?.stats.mapEntities, 0, 'MAP must not precede the PARAM stage');
+    assert.equal(result.index.getStats().events, 1, 'final index must retain the EVENT export');
+    assert.equal(result.index.getStats().mapEntities, 1, 'final index must retain the MAP export');
+    assert.equal(result.index.getStats().paramRows, 1, 'final index must retain the PARAM export');
+    // Reopening a stable workspace must hydrate the persisted semantic payload
+    // after the catalog hash check instead of parsing the same JSON resources
+    // again.  The second pass intentionally presents new mtimes with the same
+    // bytes; cache reuse is content-hash based, not timestamp based.
+    const cache = new Map();
+    let cacheHits = 0;
+    let cacheSaves = 0;
+    const semanticCache = {
+        load: (file) => {
+            const entry = cache.get(file.relativePath);
+            if (!entry || entry.fileSha256 !== file.sha256)
+                return null;
+            cacheHits += 1;
+            return entry.payload;
+        },
+        save: (file, payload) => {
+            if (!file.sha256)
+                return;
+            cacheSaves += 1;
+            cache.set(file.relativePath, { fileSha256: file.sha256, payload });
+        }
+    };
+    await analyzeWorkspace({ workspaceRoot: root, inspectNativeResources: false, semanticCache });
+    const savedAfterFirstPass = cacheSaves;
+    assert.equal(savedAfterFirstPass, 3, 'first pass must persist all semantic resources');
+    const hashedCatalog = await scanWorkspace({ workspaceRoot: root, includeContentHashes: true });
+    const restoredCatalog = hashedCatalog.files.map((file) => ({ ...file, mtimeMs: file.mtimeMs + 10_000 }));
+    const reopened = await analyzeWorkspace({
+        workspaceRoot: root,
+        files: restoredCatalog,
+        inspectNativeResources: false,
+        semanticCache
+    });
+    assert.equal(cacheHits, 3, 'reopen must load each unchanged semantic payload from cache');
+    assert.equal(cacheSaves, savedAfterFirstPass, 'cache hits must not rewrite semantic payloads');
+    assert.equal(reopened.index.getStats().paramRows, 1);
+    assert.equal(reopened.index.getStats().events, 1);
+    assert.equal(reopened.index.getStats().mapEntities, 1);
+    console.log('[workspace-pipeline-stage-smoke] staged PARAM publish and final semantic convergence passed');
+}
+finally {
+    await rm(root, { recursive: true, force: true });
+}
+//# sourceMappingURL=runWorkspacePipelineStageSmoke.js.map

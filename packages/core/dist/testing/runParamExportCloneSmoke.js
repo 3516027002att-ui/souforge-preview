@@ -1,0 +1,307 @@
+import assert from 'node:assert/strict';
+import { cloneParamExports } from '../indexing/cloneParamExport.js';
+import { WorkspaceIndex } from '../indexing/workspaceIndex.js';
+function defineOwnDataProperty(target, key, value, enumerable = true) {
+    Object.defineProperty(target, key, {
+        configurable: true,
+        enumerable,
+        writable: true,
+        value
+    });
+}
+function makeParamExport(description = 'health') {
+    const metadataNested = {
+        label: 'preserve-me',
+        date: new Date('2026-09-09T00:00:00.000Z'),
+        map: new Map(),
+        set: new Set(['future-set']),
+        bytes: new Uint8Array([1, 2, 3])
+    };
+    metadataNested.self = metadataNested;
+    metadataNested.map.set('self', metadataNested);
+    const rawObject = {
+        typeName: 'NpcParam',
+        dataHash: 'row-1',
+        nested: { keep: true }
+    };
+    rawObject.self = rawObject;
+    const sharedRaw = { marker: 'shared-raw' };
+    rawObject.aliasA = sharedRaw;
+    rawObject.aliasB = sharedRaw;
+    const rawArray = [{ typeName: 'NpcParam', dataHash: 'row-2' }];
+    rawArray.push(rawArray);
+    const firstField = {
+        fieldId: 'hp',
+        name: 'HP',
+        type: 'int32',
+        description,
+        value: 100,
+        futureField: { nested: { keep: true } }
+    };
+    return {
+        paramName: 'NpcParam',
+        sourceUri: 'file:///param/gameparam.parambnd.dcx',
+        entryName: 'NpcParam.param',
+        entryIndex: 7,
+        sourceHash: 'child-hash',
+        outerFileHash: 'outer-hash',
+        sourceRevision: 42,
+        futureMetadata: { nested: metadataNested },
+        rows: [
+            {
+                uri: 'file:///param/gameparam.parambnd.dcx#NpcParam/1',
+                sourceUri: 'file:///param/gameparam.parambnd.dcx',
+                paramName: 'NpcParam',
+                entryName: 'NpcParam.param',
+                entryIndex: 7,
+                rowId: 1,
+                rowName: 'one',
+                fields: [firstField],
+                raw: rawObject,
+                futureRow: { nested: { count: 1 } }
+            },
+            {
+                uri: 'file:///param/gameparam.parambnd.dcx#NpcParam/2',
+                sourceUri: 'file:///param/gameparam.parambnd.dcx',
+                paramName: 'NpcParam',
+                entryName: 'NpcParam.param',
+                entryIndex: 7,
+                rowId: 2,
+                fields: [{ fieldId: 'scale', name: 'Scale', value: 1.25 }],
+                raw: rawArray,
+                futureRow: { nested: { count: 2 } }
+            }
+        ]
+    };
+}
+function testCloneGranularity() {
+    const source = makeParamExport();
+    // Keep a baseline deep-equality assertion before adding extension keys that
+    // the legacy Object.keys boundary intentionally ignores (symbols/hidden).
+    assert.deepEqual(cloneParamExports([source]), [source]);
+    const ignoredSymbol = Symbol('ignored-by-param-clone');
+    let getterReads = 0;
+    defineOwnDataProperty(source, 'futureScalar', 'preserve-me');
+    defineOwnDataProperty(source, '__proto__', 'export-proto-data');
+    defineOwnDataProperty(source.rows[0], '__proto__', 'row-proto-data');
+    defineOwnDataProperty(source, 'hiddenExtension', 'ignore-me', false);
+    defineOwnDataProperty(source, ignoredSymbol, 'ignore-symbol');
+    Object.defineProperty(source, 'getterExtension', {
+        configurable: true,
+        enumerable: true,
+        get() {
+            getterReads += 1;
+            return 'getter-value';
+        }
+    });
+    const nativeStructuredClone = globalThis.structuredClone;
+    const inputs = [];
+    globalThis.structuredClone = ((value) => {
+        inputs.push(value);
+        return nativeStructuredClone(value);
+    });
+    let cloned;
+    try {
+        cloned = cloneParamExports([source]);
+    }
+    finally {
+        globalThis.structuredClone = nativeStructuredClone;
+    }
+    const forbiddenWholeInputs = new Set([
+        source,
+        source.rows,
+        source.rows[0],
+        source.rows[0].fields,
+        source.rows[1],
+        source.rows[1].fields
+    ]);
+    assert.equal(inputs.some((input) => forbiddenWholeInputs.has(input)), false, 'clone helper must not serialize the export, row, or fields table as a whole');
+    assert.ok(inputs.length >= 1 + source.rows.length, 'complex metadata/raw values remain isolated');
+    assert.ok(inputs.every((input) => typeof input === 'object' && input !== null && !Array.isArray(input)));
+    const copy = cloned[0];
+    const copyRecord = copy;
+    const sourceRecord = source;
+    assert.equal(copyRecord.futureScalar, sourceRecord.futureScalar);
+    assert.equal(copyRecord.getterExtension, 'getter-value');
+    assert.equal(getterReads, 1, 'enumerable accessors should be read once before the scalar spread');
+    assert.equal(Object.prototype.hasOwnProperty.call(copyRecord, '__proto__'), true);
+    assert.equal(copyRecord['__proto__'], 'export-proto-data');
+    assert.equal(Object.getPrototypeOf(copyRecord), Object.prototype);
+    assert.equal(Object.prototype.hasOwnProperty.call(copyRecord, 'hiddenExtension'), false);
+    assert.deepEqual(Object.getOwnPropertySymbols(copyRecord), []);
+    assert.notEqual(copy, source);
+    assert.notEqual(copy.rows, source.rows);
+    assert.notEqual(copy.rows[0], source.rows[0]);
+    const copiedRowRecord = copy.rows[0];
+    assert.equal(Object.prototype.hasOwnProperty.call(copiedRowRecord, '__proto__'), true);
+    assert.equal(copiedRowRecord['__proto__'], 'row-proto-data');
+    assert.equal(Object.getPrototypeOf(copiedRowRecord), Object.prototype);
+    assert.notEqual(copy.rows[0].fields, source.rows[0].fields);
+    assert.notEqual(copy.rows[0].fields[0], source.rows[0].fields[0]);
+    assert.notEqual(copy.rows[0].fields[0].futureField, source.rows[0].fields[0].futureField);
+    assert.notEqual(copy.rows[0].raw, source.rows[0].raw);
+    assert.notEqual(copy.rows[1].raw, source.rows[1].raw);
+    assert.notEqual(copy.futureMetadata, source.futureMetadata);
+    assert.notEqual(copy.futureMetadata.nested, source.futureMetadata.nested);
+    assert.ok(copy.futureMetadata.nested.date instanceof Date);
+    assert.ok(copy.futureMetadata.nested.map instanceof Map);
+    assert.ok(copy.futureMetadata.nested.set instanceof Set);
+    assert.ok(copy.futureMetadata.nested.bytes instanceof Uint8Array);
+    assert.equal(copy.futureMetadata.nested.self, copy.futureMetadata.nested);
+    assert.equal(copy.futureMetadata.nested.map.get('self'), copy.futureMetadata.nested);
+    assert.equal(copy.rows[0].raw.self, copy.rows[0].raw);
+    const copiedRaw = copy.rows[0].raw;
+    const sourceRaw = source.rows[0].raw;
+    assert.equal(copiedRaw.aliasA, copiedRaw.aliasB, 'unknown raw aliases should remain aliases');
+    assert.notEqual(copiedRaw.aliasA, sourceRaw.aliasA, 'unknown raw aliases should be deeply isolated');
+    assert.equal(copy.rows[1].raw[1], copy.rows[1].raw);
+    assert.notEqual(copy.rows[0].futureRow, source.rows[0].futureRow);
+    // The repeated long description is a known scalar field.  It must not be
+    // present in any serializer wrapper, while remaining complete in the copy.
+    const description = source.rows[0].fields[0].description;
+    assert.equal(copy.rows[0].fields[0].description, description);
+    assert.equal(inputs.some((input) => Object.values(input).includes(description)), false, 'known field descriptions should bypass structuredClone');
+    copy.rows[0].fields[0].value = 999;
+    copy.rows[0].raw.nested.keep = false;
+    copy.futureMetadata.nested.label = 'changed';
+    copy.futureMetadata.nested.bytes[0] = 9;
+    copy.rows[0].futureRow.nested.count = 99;
+    copy.rows[0].fields[0].futureField.nested.keep = false;
+    assert.equal(source.rows[0].fields[0].value, 100);
+    assert.equal(source.rows[0].raw.nested.keep, true);
+    assert.equal(source.futureMetadata.nested.label, 'preserve-me');
+    assert.equal(source.futureMetadata.nested.bytes[0], 1);
+    assert.equal(source.rows[0].futureRow.nested.count, 1);
+    assert.equal(source.rows[0].fields[0].futureField.nested.keep, true);
+}
+function testWorkspaceRefreshIntegration() {
+    const source = makeParamExport();
+    const index = new WorkspaceIndex('param-clone-smoke');
+    assert.equal(index.upsertParamExport(source), true);
+    const clone = index.cloneForRefresh();
+    const copied = clone.toSymbolBundle().params?.[0];
+    assert.ok(copied);
+    assert.deepEqual(copied, source);
+    assert.notEqual(copied.rows, source.rows);
+    assert.notEqual(copied.rows[0], source.rows[0]);
+    copied.rows[0].rowName = 'changed-in-refresh';
+    assert.equal(source.rows[0].rowName, 'one');
+}
+function testSharedProjectionRefreshFork() {
+    const stableSource = 'file://param/stable.parambnd.dcx#StableParam';
+    const changedSource = 'file://param/changed.parambnd.dcx#ChangedParam';
+    const stable = {
+        sourceUri: stableSource,
+        paramName: 'StableParam',
+        rows: [{ uri: `${stableSource}#1`, sourceUri: stableSource, paramName: 'StableParam', rowId: 1, rowName: 'keep', fields: [] }]
+    };
+    const changed = {
+        sourceUri: changedSource,
+        paramName: 'ChangedParam',
+        rows: [{ uri: `${changedSource}#2`, sourceUri: changedSource, paramName: 'ChangedParam', rowId: 2, rowName: 'old', fields: [] }]
+    };
+    const live = new WorkspaceIndex('param-shared-refresh-fork');
+    assert.equal(live.upsertParamExport(stable), true);
+    assert.equal(live.upsertParamExport(changed), true);
+    const liveStable = live.toSymbolBundle().params.find((item) => item.sourceUri === stableSource);
+    const fork = live.cloneForRefreshShared();
+    const forkStable = fork.toSymbolBundle().params.find((item) => item.sourceUri === stableSource);
+    assert.notEqual(fork.toSymbolBundle().params, live.toSymbolBundle().params, 'a fork owns its top-level projection arrays');
+    assert.equal(forkStable, liveStable, 'unchanged immutable export trees must be structurally shared rather than deep-cloned');
+    fork.invalidateChangedSources([changedSource]);
+    fork.rebuildReferences();
+    assert.equal(live.getStats().paramRows, 2, 'invalidating the fork must not mutate the live stale-safe baseline');
+    assert.equal(fork.getStats().paramRows, 1);
+    assert.equal(fork.upsertParamExport({ ...changed, rows: [{ ...changed.rows[0], rowName: 'fresh' }] }), true);
+    assert.equal(fork.toSymbolBundle().params.find((item) => item.sourceUri === changedSource).rows[0].rowName, 'fresh');
+    assert.equal(live.toSymbolBundle().params.find((item) => item.sourceUri === changedSource).rows[0].rowName, 'old');
+}
+function testSharedProjectionRefreshForkPreservesUntouchedCoverage() {
+    const eventSource = 'file:///event/common.emevd.dcx';
+    const paramSource = 'file:///param/gameparam.parambnd.dcx';
+    const indexedFile = (sourceUri, resourceKind) => ({
+        id: sourceUri,
+        workspaceId: 'param-shared-refresh-coverage',
+        sourceUri,
+        sourcePath: sourceUri,
+        game: 'sekiro',
+        resourceKind,
+        parseStatus: 'partial',
+        diagnostics: [],
+        absolutePath: `C:/workspace/${resourceKind}/${sourceUri.split('/').at(-1)}`,
+        relativePath: `${resourceKind}/${sourceUri.split('/').at(-1)}`,
+        extension: '.dcx',
+        compoundExtension: '.dcx',
+        formatKind: 'dcx',
+        formatLabel: 'DCX',
+        size: 1,
+        mtimeMs: 1
+    });
+    const paramExport = (rowName) => ({
+        sourceUri: paramSource,
+        paramName: 'NpcParam',
+        sourceHash: rowName,
+        rows: [{
+                uri: `${paramSource}#NpcParam/1`,
+                sourceUri: paramSource,
+                paramName: 'NpcParam',
+                rowId: 1,
+                rowName,
+                fields: []
+            }]
+    });
+    const live = new WorkspaceIndex('param-shared-refresh-coverage');
+    live.setFiles([indexedFile(eventSource, 'event'), indexedFile(paramSource, 'param')]);
+    assert.equal(live.upsertEventExport({ events: [{
+                uri: `${eventSource}#event/1`,
+                sourceUri: eventSource,
+                eventId: 1,
+                instructions: []
+            }] }), true);
+    assert.equal(live.upsertParamExport(paramExport('old')), true);
+    live.invalidateChangedSources([paramSource]);
+    const baselineCoverage = live.getCoverageState('workspace', 'event');
+    assert.deepEqual(baselineCoverage.coveredResourceIds, [eventSource]);
+    const published = live.cloneForRefreshShared();
+    assert.equal(published.upsertParamExport(paramExport('fresh')), true);
+    const publishedCoverage = published.getCoverageState('workspace', 'event');
+    assert.deepEqual(publishedCoverage.coveredResourceIds, baselineCoverage.coveredResourceIds, 'refreshing PARAM on a shared clone must not erase the untouched EMEVD coverage projection');
+}
+function makeRepeatedDescriptionExport(rowCount) {
+    const description = 'repeated-long-description-'.repeat(128);
+    return {
+        paramName: 'NpcParam',
+        sourceUri: 'file:///param/benchmark.param',
+        rows: Array.from({ length: rowCount }, (_, rowIndex) => ({
+            uri: `file:///param/benchmark.param#NpcParam/${rowIndex}`,
+            sourceUri: 'file:///param/benchmark.param',
+            paramName: 'NpcParam',
+            rowId: rowIndex,
+            fields: [
+                { fieldId: 'description', name: 'Description', type: 'string', description, value: description }
+            ],
+            raw: { rowIndex }
+        }))
+    };
+}
+function measureClone(label, operation) {
+    const before = process.memoryUsage().heapUsed;
+    const start = performance.now();
+    operation();
+    return { label, ms: performance.now() - start, heapDelta: process.memoryUsage().heapUsed - before };
+}
+function reportLightweightComparison() {
+    // This is deliberately a modest, bounded comparison. It reports observations
+    // only; no machine-specific timing/heap threshold is promoted to a PASS gate.
+    const sample = makeRepeatedDescriptionExport(96);
+    const dto = measureClone('dto', () => cloneParamExports([sample]));
+    const whole = measureClone('structuredClone-whole-export', () => structuredClone([sample]));
+    console.log(`param export clone comparison: ${JSON.stringify({ rows: sample.rows.length, dto, whole })}`);
+}
+testCloneGranularity();
+testWorkspaceRefreshIntegration();
+testSharedProjectionRefreshFork();
+testSharedProjectionRefreshForkPreservesUntouchedCoverage();
+reportLightweightComparison();
+console.log('param export clone smoke: PASS');
+//# sourceMappingURL=runParamExportCloneSmoke.js.map

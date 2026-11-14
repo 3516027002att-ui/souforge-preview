@@ -1,0 +1,211 @@
+import { buildParamReferenceEdges } from './paramReferenceProvider.js';
+import { buildParamTextReferenceEdges } from './paramTextReferences.js';
+import { buildEventReferenceEdges } from './eventReferenceProvider.js';
+import { buildScriptReferenceEdges } from './scriptReferenceProvider.js';
+import { buildMapReferenceEdges } from './mapReferenceProvider.js';
+import { buildContainerMemberEdges } from './containerMemberProvider.js';
+import { REFERENCE_CAPABILITIES } from './referenceCapabilityRegistry.js';
+/**
+ * Target-index view the event provider needs; assembled from the same bundle
+ * so shard caching keys on the bundle's sources, not a separate index.
+ */
+function eventTargetIndexes(bundle) {
+    const mapEntitiesByEntityId = new Map();
+    const paramRowsById = new Map();
+    const paramRowsByScopedId = new Map();
+    const textsById = new Map();
+    for (const mapExport of bundle.maps ?? []) {
+        for (const entity of mapExport.entities) {
+            if (typeof entity.entityId === 'number') {
+                const list = mapEntitiesByEntityId.get(entity.entityId) ?? [];
+                list.push({ uri: entity.uri, ...(entity.mapId ? { mapId: entity.mapId } : {}) });
+                mapEntitiesByEntityId.set(entity.entityId, list);
+            }
+        }
+        for (const region of mapExport.regions) {
+            if (typeof region.entityId === 'number') {
+                const list = mapEntitiesByEntityId.get(region.entityId) ?? [];
+                list.push({ uri: region.uri, ...(region.mapId ? { mapId: region.mapId } : {}) });
+                mapEntitiesByEntityId.set(region.entityId, list);
+            }
+        }
+    }
+    for (const paramExport of bundle.params ?? []) {
+        for (const row of paramExport.rows) {
+            const list = paramRowsById.get(row.rowId) ?? [];
+            list.push({ uri: row.uri });
+            paramRowsById.set(row.rowId, list);
+            // Keyed by the row's own paramName (the typeName the event arg references),
+            // matching the scoped lookup in eventReferenceProvider.
+            const key = `${row.paramName.toLowerCase()}#${row.rowId}`;
+            const scoped = paramRowsByScopedId.get(key) ?? [];
+            scoped.push({ uri: row.uri });
+            paramRowsByScopedId.set(key, scoped);
+        }
+    }
+    for (const msgExport of bundle.msgs ?? []) {
+        for (const entry of msgExport.entries) {
+            const list = textsById.get(entry.textId) ?? [];
+            list.push({ uri: entry.uri });
+            textsById.set(entry.textId, list);
+        }
+    }
+    return { mapEntitiesByEntityId, paramRowsById, paramRowsByScopedId, textsById };
+}
+/**
+ * Literal lookup index for the bounded script observation channel.  It is
+ * intentionally built from symbols that already have a stable URI; this
+ * helper does not invent an API namespace or infer a foreign key from names.
+ */
+function scriptLiteralTargetIndexes(bundle) {
+    const numeric = new Map();
+    const strings = new Map();
+    const addNumeric = (value, target) => {
+        if (value === undefined || !Number.isSafeInteger(value))
+            return;
+        const list = numeric.get(value) ?? [];
+        list.push(target);
+        numeric.set(value, list);
+    };
+    const addString = (value, target) => {
+        if (!value || value.trim().length === 0)
+            return;
+        const key = value.trim().toLocaleLowerCase();
+        const list = strings.get(key) ?? [];
+        list.push(target);
+        strings.set(key, list);
+    };
+    for (const eventExport of bundle.events ?? []) {
+        for (const event of eventExport.events) {
+            const target = { uri: event.uri, label: `event ${event.eventId}` };
+            addNumeric(event.eventId, target);
+            addString(event.name, target);
+        }
+    }
+    for (const mapExport of bundle.maps ?? []) {
+        for (const entity of [...mapExport.entities, ...mapExport.regions]) {
+            const target = { uri: entity.uri, label: entity.name };
+            addNumeric(entity.entityId, target);
+            addString(entity.name, target);
+        }
+    }
+    for (const paramExport of bundle.params ?? []) {
+        for (const row of paramExport.rows) {
+            const target = { uri: row.uri, label: `${row.paramName}#${row.rowId}` };
+            addNumeric(row.rowId, target);
+            addString(row.rowName, target);
+        }
+    }
+    for (const msgExport of bundle.msgs ?? []) {
+        for (const entry of msgExport.entries) {
+            const target = { uri: entry.uri, label: `${entry.category ?? 'text'}#${entry.textId}` };
+            addNumeric(entry.textId, target);
+            addString(entry.text, target);
+        }
+    }
+    for (const scriptExport of bundle.scripts ?? []) {
+        for (const child of scriptExport.scripts) {
+            const target = { uri: child.uri, label: child.entryName ?? child.childChain.join('/') };
+            addString(child.entryName, target);
+            addString(child.childChain[child.childChain.length - 1], target);
+        }
+    }
+    return { numeric, strings };
+}
+export function buildNameMatchEdges(bundle) {
+    const texts = new Map();
+    const normalize = (value) => value.trim().normalize('NFC').toLocaleLowerCase();
+    for (const item of bundle.msgs ?? []) {
+        for (const entry of item.entries) {
+            const name = normalize(entry.text);
+            if (!name)
+                continue;
+            const values = texts.get(name) ?? [];
+            values.push({ uri: entry.uri, text: entry.text });
+            texts.set(name, values);
+        }
+    }
+    const edges = [];
+    const diagnostics = [];
+    for (const table of bundle.params ?? []) {
+        for (const row of table.rows) {
+            const name = normalize(row.rowName ?? '');
+            if (!name)
+                continue;
+            const matches = texts.get(name) ?? [];
+            for (const entry of matches.slice(0, 16)) {
+                edges.push({
+                    fromUri: row.uri, toUri: entry.uri, kind: 'name_match', confidence: 'low',
+                    reason: `同名：参数行名与文本内容“${row.rowName}”一致；仅名称匹配，不代表文本 ID 等于参数行 ID，也不表示存在外键。`,
+                    evidence: [{ sourceUri: entry.uri, excerpt: entry.text }]
+                });
+            }
+            if (matches.length > 16)
+                diagnostics.push({ severity: 'info', code: 'NAME_MATCH_LIMIT',
+                    message: `“${row.rowName}”命中 ${matches.length} 条同名文本，本次显示前 16 条；可用 search_text_entries 搜索该名称继续读取。`, sourceUri: row.sourceUri });
+        }
+    }
+    return { edges, diagnostics };
+}
+export const REFERENCE_PROVIDERS = Object.freeze([
+    { id: 'content-name-match', domains: ['param', 'msg'], build: buildNameMatchEdges },
+    {
+        id: 'param-refs',
+        domains: ['param'],
+        build: (bundle) => buildParamReferenceEdges(bundle.params ?? [])
+    },
+    {
+        id: 'param-text',
+        domains: ['param', 'msg'],
+        build: (bundle) => ({
+            edges: buildParamTextReferenceEdges(bundle.params ?? [], bundle.msgs ?? []),
+            diagnostics: []
+        })
+    },
+    {
+        id: 'emevd-refs',
+        domains: ['event'],
+        build: (bundle, options) => {
+            const result = buildEventReferenceEdges(bundle.events ?? [], eventTargetIndexes(bundle), {
+                ...(options.enableNumericFallback !== undefined ? { enableNumericFallback: options.enableNumericFallback } : {}),
+                ...(options.maxAmbiguousNumericMatches !== undefined ? { maxAmbiguousNumericMatches: options.maxAmbiguousNumericMatches } : {}),
+                ...(options.includeHypotheses !== undefined ? { includeHypotheses: options.includeHypotheses } : {}),
+                ...(options.registry ? { registry: options.registry } : {})
+            });
+            return {
+                edges: result.edges,
+                diagnostics: result.diagnostics,
+                suppressedAmbiguousNumbers: result.stats.suppressedAmbiguousNumbers
+            };
+        }
+    },
+    {
+        id: 'script-refs',
+        domains: ['script', 'ai'],
+        build: (bundle, options) => buildScriptReferenceEdges(bundle.scripts ?? [], {
+            ...(options.includeHypotheses !== undefined ? { includeHypotheses: options.includeHypotheses } : {}),
+            literalTargets: scriptLiteralTargetIndexes(bundle)
+        })
+    },
+    {
+        id: 'map-refs',
+        domains: ['map', 'param'],
+        build: (bundle, options) => buildMapReferenceEdges(bundle.maps ?? [], bundle.params ?? [], {
+            ...(options.includeHypotheses !== undefined ? { includeHypotheses: options.includeHypotheses } : {})
+        })
+    },
+    {
+        id: 'container-members',
+        domains: ['action', 'msg'],
+        build: (bundle) => buildContainerMemberEdges(bundle.tae ?? [], bundle.msgs ?? [])
+    }
+]);
+/** Providers whose domains include the given ResourceKind. */
+export function providersForDomain(domain) {
+    return REFERENCE_PROVIDERS.filter((provider) => provider.domains.includes(domain));
+}
+/** Capability entry for a domain; throws on unregistered kinds (exhaustive). */
+export function capabilityForDomain(domain) {
+    return REFERENCE_CAPABILITIES[domain];
+}
+//# sourceMappingURL=referenceProviderRegistry.js.map

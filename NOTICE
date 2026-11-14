@@ -1,0 +1,65 @@
+SoulForge
+Copyright 2026 SoulForge contributors
+
+This product includes software developed as part of the SoulForge project,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------
+Third-party attributions
+--------------------------------------------------------------------------
+
+openai/codex (Apache License 2.0, Copyright 2025 OpenAI)
+
+  The AI agent kernel in packages/core/src/model-services/ carries designs
+  derived from openai/codex. The derivation is by design reference, not a
+  verbatim source copy. Each deriving file states the derivation in its
+  header comment:
+
+    packages/core/src/model-services/agentLoop.ts
+    packages/core/src/model-services/contextCompactor.ts
+    packages/core/src/model-services/retryPolicy.ts
+    packages/core/src/model-services/rolloutRecorder.ts
+
+  openai/codex is itself Apache-2.0 licensed, so this derivation is
+  license-compatible with SoulForge's own Apache-2.0 terms. The complete
+  Apache-2.0 license is retained at licenses/openai-codex.txt, including for
+  historical attribution links. Design source: https://github.com/openai/codex.
+
+--------------------------------------------------------------------------
+
+Runtime and build dependencies retain their own licenses. Copies of the
+licenses for redistributed binary dependencies are kept under licenses/.
+
+The shared spectral theme shader, palette math and theme presets are adapted
+from liuguang-banlan-ui in sickn33/agentic-awesome-skills, revision
+8117e465a734870cc755bb0a31deb6b2d863d1d6 (PR #1743), under the MIT License.
+The complete permission notice is retained in licenses/liuguang-banlan-ui-MIT.txt.
+
+FromSoftware file formats are interoperated with for modding purposes.
+SoulForge ships no game assets, no proprietary compression libraries, and
+no FromSoftware code. External FromSoftware community tools are consulted
+for behavior, format-family and workflow comparison only; incompatibly
+licensed source is not copied.
+
+The checked-in first-party Sekiro PARAM schema includes a normalized semantic
+projection of Paramdex-compatible metadata. The projection is distributed
+under the MIT terms applicable to the reviewed Smithbox/Paramdex metadata
+source; the required notice is retained here and no Smithbox executable or
+runtime is shipped:
+
+  Copyright (c) 2025 Vawser
+  Copyright (c) 2018 Katalash, Meowmaritus
+
+The complete MIT permission notice for this metadata projection is included
+at licenses/Smithbox-Paramdex-Metadata-MIT.txt.
+
+The first-party HKS decompiler contains source-derived portions from
+DSLuaDecompiler, licensed under MIT; the complete notice is included at
+licenses/DSLuaDecompiler-MIT.txt. The first-party HKS compiler contains the
+reviewed hksc source under its original copyright/permission terms; see
+licenses/hksc-COPYRIGHT.txt.
+
+The EMEVD schema is maintained as SoulForge semantic data. DarkScript3,
+Smithbox and Yapped remain development/validation references only; their
+installations, runtime adapters and restricted data are not production
+dependencies or release inputs.
