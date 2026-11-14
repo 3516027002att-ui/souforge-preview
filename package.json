@@ -5,7 +5,10 @@
   "description": "SoulForge Preview — a read-only and controlled-write workbench for Sekiro modding, packaged as an agent skill.",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=22.22.0"
+    "node": ">=22.22.0 <23"
+  },
+  "scripts": {
+    "test": "node --test test/preview-bundle.test.cjs"
   },
   "soulforge": {
     "builtAt": "2026-11-14T03:26:43.429Z",

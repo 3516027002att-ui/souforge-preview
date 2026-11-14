@@ -1,6 +1,6 @@
 ---
-name: soulforge-preview
-description: 只读+受控写入的《只狼》Mod 工作台。用文本目录把「Mod 副本目录（工作区）」和「游戏安装根（--base）」绑定到 CLI，然后搜索、精确读取、与原版对照，并在隔离副本上做单字段修改和回滚。适用于 FromSoftware 资源（PARAM/FMG/EMEVD/MSB/TAE/FLVER/TPF/GPARAM/脚本）的定位、读取与受控编辑。
+name: soulforge
+description: 在《只狼》Mod 目录中搜索、精确读取、对照游戏原版或受控修改 PARAM、FMG、EMEVD、MSB、TAE 与脚本等资源。适用于直接检查或编辑正在使用的 Mod，以及按已提交的操作回滚。
 ---
 
 # SoulForge Preview
@@ -8,19 +8,16 @@ description: 只读+受控写入的《只狼》Mod 工作台。用文本目录�
 SoulForge 把 FromSoftware 原生格式的生产解析放在 C# Bridge 里，工具通过一个本地 CLI
 （`sfcli`）暴露。这个 skill 教你如何绑定两个目录、用哪个工具、以及哪些操作会失败。
 
-**先读「绑定」一节再执行任何命令。** 绑定错了，写入会落进真实 Mod。
+仅查看工具目录或 schema 不需要绑定游戏。编辑工作区就是游戏加载的 Mod 目录，不需要另建副本或部署。
 
-所有命令都通过包内的启动器执行（它会设置 `SOULFORGE_ROOT`，直接调 `sfcli.mjs` 会找不到
-编译包）：
+下文的 PowerShell 示例均从本 `SKILL.md` 所在目录执行，使用包内启动器：
 
 ```powershell
-<PACKAGE>\bin\sfcli.cmd <参数>      # Windows
-<PACKAGE>/bin/sfcli <参数>           # POSIX
+.\bin\sfcli.cmd --json list
 ```
 
-下文用 `<PACKAGE>` 指打包目录，`sfcli` 指上述启动器。
-
-启动器会检查 Node 版本：低于 22 直接拒绝，高于 22 打印「未经验证」提示后继续。
+启动器验证 Windows x64、x64 版 Node.js 22.22.0 或更新的 22.x，以及随包 SQLite 能否加载。
+自检失败就停止并告知用户，不要替用户安装 Node、重建依赖或绕过启动器。
 
 ## 一、绑定：两个目录，用文本目录记录
 
@@ -28,56 +25,61 @@ SoulForge 把 FromSoftware 原生格式的生产解析放在 C# Bridge 里，工
 
 | 名称 | 含义 | 传入方式 |
 |---|---|---|
-| 工作区（workspace） | **Mod 的副本目录**，所有写入落在这里 | `--workspace <路径>` 或 `SOULFORGE_WORKSPACE` |
+| 工作区（workspace） | **用户要操作的 Mod 根目录**，可以是游戏正在使用的 `<游戏根>\mods` | `--workspace <路径>` 或 `SOULFORGE_WORKSPACE` |
 | 游戏根（base） | 《只狼》**安装根**，其下直接是 `event/`、`param/`、`chr/`，并且有 `sekiro.exe` 与 `oo2core_6_win64.dll` | `--base <路径>` 或 `SOULFORGE_SEKIRO_ROOT` |
 
-在本 skill 目录里维护一份 `binding.md`（文本目录），只写这两行：
+优先使用用户本轮明确给出的路径，其次读取本 skill 根目录的 `binding.md`；缺哪项只问哪项。
+需要保存时，`binding.md` 只写下面两行，并且不要提交：
 
 ```text
-workspace: <Mod 副本的绝对路径>
+workspace: <Mod 根目录的绝对路径>
 base:      <只狼安装根的绝对路径>
 ```
 
 首次使用时复制模板再填：
 
 ```powershell
-Copy-Item <PACKAGE>\skill\binding.template.md "<任意位置>\binding.md"
+if (-not (Test-Path -LiteralPath 'binding.md')) {
+    Copy-Item -LiteralPath 'binding.template.md' -Destination 'binding.md'
+}
 ```
 
-每次会话开始先读它，然后用它拼命令。**不要猜路径，不要在工作区里搜索游戏文件。**
+读取路径值时只按第一个冒号分隔键和值，保留盘符中的冒号。**不要猜路径，也不要搜盘找游戏。**
 
-### 绑定的四条硬纪律
+### 区分 Mod 与原版
 
-1. **工作区必须是副本，不是真实 Mod。** 工具没有任何「拒绝写进真实 mods」的保护：
-   `--workspace` 指向哪里，写入就落在哪里。若绑定文本里 workspace 指向
-   `<游戏根>\mods`，或者路径里出现 `sekiro.exe`，**停止**，先复制一份副本。
-2. **base 是安装根，不是 mods。** base 只用于读取原版做对照；指到 mods 会让「原版」返回
-   Mod 的内容。
-3. **路径拼写固定。** junction 路径与真实路径共享同一份工作区数据库（键来自物理路径），
-   但为可读性，绑定文本统一写一种拼写，不要混用。
-4. **只读任务一律先 `--mode plan`。** plan 模式会拒绝所有写入工具；确认要改再重启为
-   `--mode normal`。
+- **写入只落在 `workspace`。** 不要把游戏安装根、游戏根的父目录或原版 `param/`、`event/` 等当 Mod 工作区。
+- **`base` 是只读原版。** 读取原版用 `origin:"base"` 和工作区内的相对资源路径，例如 `event/m11_00_00_00.emevd.dcx`。
+- CLI 会解析 Junction。后续调用使用预检返回的实际 Mod 路径。
+- **只读任务使用 `--mode plan`。** 用户明确要改且游戏已退出时，才用 `--mode normal`。
 
 ## 二、开工前必须做的 preflight
 
-绑定后，第一条命令固定是下面两条；任一失败就停，并把诊断报给用户：
+绑定后，从安装目录执行以下命令。把 `$workspace` 和 `$base` 的值换成已确认的实际路径：
 
 ```powershell
-<PACKAGE>\bin\sfcli.cmd --workspace "<workspace>" --base "<base>" preflight
-<PACKAGE>\bin\sfcli.cmd --workspace "<workspace>" --base "<base>" --quiet call workspace_stats '{}'
+$workspace = '<MOD_ROOT>'
+$base = '<GAME_ROOT>'
+$binding = .\bin\sfcli.cmd --workspace "$workspace" --base "$base" --json preflight
+if ($LASTEXITCODE -ne 0) { throw '绑定预检失败。' }
+$binding = $binding | ConvertFrom-Json
+$workspace = $binding.workspace
+$base = $binding.base
+
+# JSON 用 stdin，不要直接作为 .cmd 的参数；中文请求用 UTF-8。
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $OutputEncoding
+'{}' | .\bin\sfcli.cmd --workspace "$workspace" --base "$base" --mode plan --json --quiet call --stdin workspace_stats
 ```
 
-- **`preflight` 必须 exit 0。** 它会检查工作区是不是副本、base 是不是安装根。退出码 2 时
-  会列出问题（`WORKSPACE_LOOKS_LIKE_MODS`、`WORKSPACE_IS_GAME_ROOT`、`WORKSPACE_INSIDE_BASE`、
-  `BASE_NOT_GAME_ROOT` 等）。**出现任何一条就不要继续写**，让用户改绑定。
-- 会话打开时如果 `--base` 不是安装根，stderr 会出现 `CLI_BASE_NOT_GAME_ROOT` 或
-  `CLI_BASE_OODLE_MISSING`。**看到这两条就停下来问用户**：此时 `origin:"base"` 读到的可能
-  是 Mod 自己的字节，原版对照的结论不可信。
-- `workspace_stats` 应返回非零 `files`；全 0 说明工作区是空的或路径错。
+- **`preflight` 必须 exit 0。** 工作区可以在安装根下，但不能与 `base` 相同、包含 `base` 或指到原版资源目录。
+  退出码 2 时先报告 `findings` 并纠正路径。预检不启动 Bridge；通过不等于已经读到原版。
+- 确认 `workspace_stats` 的退出码为 0、`ok: true`，并且 `data.record.files` 非零。
 - 可选的一条原版对照自检（不指定的 `NpcParam` 行可能不存在，所以只在用户确认有该行时用）：
 
 ```powershell
-<PACKAGE>\bin\sfcli.cmd --workspace "<workspace>" --base "<base>" --quiet call read_param_fields '{"table":"NpcParam","rowIds":[50800000],"fieldIds":["ninsatuNum"],"origin":"base"}'
+'{"table":"NpcParam","rowIds":[50800000],"fieldIds":["ninsatuNum"],"origin":"base"}' |
+    .\bin\sfcli.cmd --workspace "$workspace" --base "$base" --mode plan --json --quiet call --stdin read_param_fields
 ```
 
   只狼原版 `ninsatuNum` 是 2。报 `BASE_ROOT_UNAVAILABLE` 或 `BASE_FILE_MISSING` 说明 base 绑错。
@@ -92,6 +94,8 @@ Copy-Item <PACKAGE>\skill\binding.template.md "<任意位置>\binding.md"
 - **id 每次现生成。** 同一个 id 只重放旧结果；换了参数再用同一 id 会被拒
   （`CLI_REQUEST_ID_CONFLICT`）。
 - **响应按 `id` 关联，不能按行序。** session 的输出不保证与输入同序。
+- **用 EOF 正常结束会话。** 收齐本次请求的响应（写入后还要回读），从调用端关闭子进程的 stdin，等待进程退出。
+  例如，用 Node.js 调用 `child.stdin.end()`。不要把 `Ctrl+Z` 当作请求发送，也不要用 `Ctrl+C` 正常收尾。
 - **读证明绑定对象本身。** 同一对象被写过后它的证明作废（`NATIVE_READ_STALE`），再写要重读。
 - **分页要翻到 `hasMore=false`** 才算整表读证据；`nextActions` 可以直接原样执行。
 
@@ -100,8 +104,8 @@ Copy-Item <PACKAGE>\skill\binding.template.md "<任意位置>\binding.md"
 工具目录以 CLI 为准，不要手抄。查目录**不需要工作区**：
 
 ```powershell
-<PACKAGE>\bin\sfcli.cmd --json list
-<PACKAGE>\bin\sfcli.cmd --json describe <tool>
+.\bin\sfcli.cmd --json list
+.\bin\sfcli.cmd --json describe read_param_fields
 ```
 
 69 个工具，权限分布：read 41、analyze 11、propose 3、validate 1、commit 12、rollback 1。
@@ -115,19 +119,26 @@ Copy-Item <PACKAGE>\skill\binding.template.md "<任意位置>\binding.md"
 - **写**：`mutate_param_fields`、`mutate_fmg_entries`、`apply_emevd_dsl`、`mutate_tae_event_fields`、
   `mutate_msb_part_transform`、`mutate_luabnd_script`。写入走 Patch Engine：暂存、备份、日志、
   原生回读；提交回执见 `transaction.opId`。
-- **回滚**：`list_operations` 列出历史，`rollback_operation` 撤销一条。
-  **回滚需要 `--mode fullPermission` 且带 `--confirm-rollback <opId>`**；`normal` 模式下
-  回滚会被 `TOOL_PERMISSION_DENIED` 拒绝（这是实测过的，不是猜测）。
+- **回滚**：`list_operations` 列出历史，`rollback_operation` 撤销一条已提交的写入。
 
-完整写入+回滚示例（同一个工作区，从 package 目录执行）：
+### 原地编辑与回滚
+
+用户明确授权且游戏已退出后才写入或回滚。在同一个 `--mode normal` 的 `session` 中先原生读取目标，再用对应领域的写入工具。
+Patch Engine 会在 SoulForge 的本地数据目录保存本次所改文件的原版本和操作记录，不需要 Git、手工备份或另建 Mod 副本。
+如果工具报告备份或持久日志不可用，停止，不要改用普通文件写入补做。成功后原生回读，报告改了什么和 `transaction.opId`，
+用户可以沿用原有配置启动游戏。
+
+撤销时使用写入回执中的 `opId`，或从同一工作区的 `list_operations` 找到对应记录。需要
+`--mode fullPermission` 和绑定到该操作的 `--confirm-rollback`：
 
 ```powershell
-# 写：读+写在同一个 session 进程里
-'{...read frame...}','{...write frame...}' | <PACKAGE>\bin\sfcli.cmd --workspace "<workspace>" --base "<base>" session
-# 回滚：显式授权一条 opId
-<PACKAGE>\bin\sfcli.cmd --workspace "<workspace>" --base "<base>" --mode fullPermission `
-  --confirm-rollback <opId> --quiet call rollback_operation '{"opId":"<opId>"}'
+$opId = '<已授权回滚的 opId>'
+@{opId = $opId} | ConvertTo-Json -Compress |
+    .\bin\sfcli.cmd --workspace "$workspace" --base "$base" --mode fullPermission --confirm-rollback "$opId" --json --quiet call --stdin rollback_operation
 ```
+
+回滚只恢复该操作所改的文件。遇到 `ROLLBACK_TARGET_CHANGED`，先报告冲突，不强行覆盖；若由同一文件上更晚的操作造成，
+经用户授权后按从新到旧的顺序回滚，再原生回读。操作结果不明时先查日志，不自动重试写入。
 
 **在 skill 环境里不可用的工具**：`read_memory`、`write_memory`、`list_memories`（没有持久记忆
 存储）、`query_knowledge` / `read_knowledge_claims`（空语料）。不要反复尝试。
@@ -147,8 +158,7 @@ Copy-Item <PACKAGE>\skill\binding.template.md "<任意位置>\binding.md"
 ## 六、已知限制（如实告知用户）
 
 - 只支持 Windows x64 与《只狼》Sekiro 1.6.x；Oodle 库由用户自备（不随包分发）。
-- 需要 Node.js 22.22.0（本包在该版本上验证）。其它版本未验证，尤其 `--analyze` 在
-  Node 24 + better-sqlite3 12.11.1 上有已知 abort。
+- 需要 Node.js 22.22.0 或更新的 22.x（x64）。启动器拒绝与随包 SQLite 不匹配的 Node 版本。
 - 读正确性用 `compare/run.mjs` 与成熟参考工具比对：FMG/TAE/EMEVD/MSB/TPF/GPARAM 已比对；
   PARAM 有 7 张表因参考工具缺定义而未比对（`reference-unsupported`）。
 - 全部引用扫描（`find_references`）在大工作区上可能需要数十秒并返回 `partial`；不要把它当成

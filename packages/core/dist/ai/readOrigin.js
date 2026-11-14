@@ -17,10 +17,11 @@
  * mod overlay, not vanilla, so base reads never fall back into it — answering
  * "vanilla" with a mod file is the exact failure this is meant to remove.
  */
-import { stat } from 'node:fs/promises';
-import { isAbsolute, join, relative } from 'node:path';
+import { realpath, stat } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fail, normalizeFileToken, resolveIndexedResourceFile } from './toolRegistrySupport.js';
 import { normalizeRelativeToken, parseFileUriToken } from '../editing/fileToken.js';
+import { isPathInside } from '../workspace/pathBoundary.js';
 /** The layer-agnostic provenance block every origin-aware read publishes. */
 export function readOriginSource(origin, relativePath) {
     return { root: origin, path: relativePath };
@@ -68,33 +69,62 @@ export async function resolveBaseOriginFile(context, input) {
     const fileUri = parseFileUriToken(token);
     if (fileUri?.kind === 'invalid')
         return invalidFileUri(fileUri.message, { origin: 'base' });
-    const relativePath = baseRelativePath(token, baseRoot, context.session?.layers.overlayRoot);
-    if (relativePath === undefined) {
-        return {
-            ok: false,
-            code: 'BASE_ORIGIN_PATH_INVALID',
-            message: `无法把 ${token} 映射到原版目录内的相对路径；origin:"base" 只接受工作区相对路径、file:// 资源身份或原版目录内的绝对路径。`,
-            details: { origin: 'base' }
-        };
-    }
-    const absolutePath = join(baseRoot, ...relativePath.split('/'));
-    const info = await stat(absolutePath).then((value) => value).catch(() => undefined);
-    if (!info?.isFile()) {
-        return {
-            ok: false,
-            code: 'BASE_FILE_MISSING',
-            message: `原版目录里没有 ${relativePath}。--base 必须指向只狼安装根目录（其下直接是 event/、param/、chr/），`
-                + '不是 mods/ 里的某个 mod；没有同名原版文件就无法回答「原版是什么」。',
+    const refused = (message, path) => ({
+        ok: false, code: 'BASE_ORIGIN_PATH_INVALID', message,
+        details: { origin: 'base', ...(path === undefined ? {} : { path }) }
+    });
+    const overlayRoot = context.session?.layers?.overlayRoot;
+    try {
+        const [physicalBase, physicalOverlay] = await Promise.all([
+            realpath(baseRoot),
+            overlayRoot === undefined ? undefined : realpath(overlayRoot)
+        ]);
+        if (physicalOverlay && isPathInside(physicalOverlay, physicalBase)) {
+            return refused('--base 指向当前 Mod 工作区内的目录，无法独立读取原版。');
+        }
+        // Prefer overlay-relative identities: nested Mod files also sit below --base,
+        // but their `mods/` prefix must not be carried into an original read.
+        const fromHost = (candidate) => (overlayRoot === undefined ? undefined : workspaceRelativePath(overlayRoot, candidate))
+            ?? (physicalOverlay === undefined ? undefined : workspaceRelativePath(physicalOverlay, candidate))
+            ?? workspaceRelativePath(baseRoot, candidate)
+            ?? workspaceRelativePath(physicalBase, candidate);
+        const relativePath = fileUri?.kind === 'host-path'
+            ? fromHost(fileUri.path)
+            : fileUri?.kind === 'workspace-relative'
+                ? fileUri.relativePath
+                : isAbsolute(token)
+                    ? fromHost(token)
+                    : normalizeRelativeToken(token.replace(/^base:\/\//iu, ''));
+        if (relativePath === undefined) {
+            return refused('无法将资源映射到原版，使用工作区相对路径、资源 URI 或已绑定目录中的绝对路径。');
+        }
+        const candidate = resolve(physicalBase, ...relativePath.split('/'));
+        if (!isPathInside(physicalBase, candidate) || (physicalOverlay && isPathInside(physicalOverlay, candidate))) {
+            return refused('原版资源路径落在当前 Mod 工作区或原版目录之外。', relativePath);
+        }
+        const missing = () => ({
+            ok: false, code: 'BASE_FILE_MISSING',
+            message: `原版目录里没有 ${relativePath}；不会用工作区资源代替原版。`,
             details: { origin: 'base', path: relativePath }
-        };
+        });
+        const physicalFile = await realpath(candidate).catch((error) => {
+            if (error.code === 'ENOENT' || error.code === 'ENOTDIR')
+                return undefined;
+            throw error;
+        });
+        if (!physicalFile)
+            return missing();
+        if (!isPathInside(physicalBase, physicalFile) || (physicalOverlay && isPathInside(physicalOverlay, physicalFile))) {
+            return refused('原版资源经链接指向当前 Mod 工作区或原版目录之外。', relativePath);
+        }
+        if (!(await stat(physicalFile)).isFile())
+            return missing();
+        // Give readers the same physical path we verified, not the original link.
+        return { ok: true, origin: 'base', path: physicalFile, sourceUri: `base://${relativePath}`, relativePath };
     }
-    return {
-        ok: true,
-        origin: 'base',
-        path: absolutePath,
-        sourceUri: `base://${relativePath}`,
-        relativePath
-    };
+    catch {
+        return refused('无法核实原版资源的实际路径，已拒绝标记为 base。');
+    }
 }
 /**
  * Resolve a file token for one read, from the workspace catalog (default) or
@@ -160,36 +190,11 @@ export function rejectWriteOrigin(name, permissionLevel, origin) {
 function invalidFileUri(message, details) {
     return { ok: false, code: 'INVALID_FILE_URI', message, ...(details === undefined ? {} : { details }) };
 }
-function baseRelativePath(token, baseRoot, overlayRoot) {
-    const baseUri = /^base:\/\/(.+)$/iu.exec(token);
-    if (baseUri?.[1])
-        return normalizeRelativeToken(baseUri[1]);
-    const fileUri = parseFileUriToken(token);
-    if (fileUri !== undefined) {
-        if (fileUri.kind === 'host-path')
-            return hostPathRelative(fileUri.path, baseRoot, overlayRoot);
-        if (fileUri.kind === 'workspace-relative')
-            return fileUri.relativePath;
-        return undefined; // already refused by the caller with INVALID_FILE_URI
-    }
-    if (isAbsolute(token))
-        return hostPathRelative(token, baseRoot, overlayRoot);
-    return normalizeRelativeToken(token);
-}
-function hostPathRelative(candidate, baseRoot, overlayRoot) {
-    const fromBase = workspaceRelativePath(baseRoot, candidate);
-    if (fromBase !== undefined)
-        return fromBase;
-    // A workspace path names the same relative file, so it can be re-rooted on
-    // the base layer: that is what makes `origin:"base"` work with the
-    // identities other tools already returned.
-    return overlayRoot === undefined ? undefined : workspaceRelativePath(overlayRoot, candidate);
-}
 function workspaceRelativePath(root, absolutePath) {
     if (!isAbsolute(absolutePath))
         return undefined;
     const rel = relative(root, absolutePath);
-    if (rel === '' || rel.startsWith('..') || isAbsolute(rel))
+    if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel))
         return undefined;
     return rel.replaceAll('\\', '/');
 }

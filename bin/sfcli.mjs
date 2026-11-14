@@ -23,9 +23,9 @@
  *   --diagnostics        将阶段耗时与游标诊断以 JSON Lines 写入 stderr
  */
 
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 import process from 'node:process';
 import { createInterface } from 'node:readline';
 
@@ -410,7 +410,7 @@ function printUsage() {
   agent exec --task-file <file> --provider test --test-config <private-test>  原始加密配置（须显式预算及价格）
   agent exec ... --protocol-stdin  JSON Lines双向审批/取消（绑定当前精确请求）
   agent exec ... --resume-session <rollout.jsonl>  历史承接＋journal回查，不重放旧调用
-  preflight                    检查 --workspace / --base 绑定是否指向副本与安装根（不打开工作区）
+  preflight                    检查 Mod 工作区与只读游戏根的绑定（不打开工作区）
   list                         列出全部工具
   describe <name>              查看工具说明与输入 schema
   describe --tool <name>       同上（两种写法等价）
@@ -427,7 +427,7 @@ session 模式（读+写必须同进程）:
   需要先读后写时用 session：一次进程内从 stdin 逐行读请求帧，向 stdout 逐行写响应帧。
 
   启动:
-    node tools/soulforge-cli/sfcli.mjs --workspace <副本工作区目录> [--base <游戏根>] session
+    node tools/soulforge-cli/sfcli.mjs --workspace <Mod目录> [--base <游戏根>] session
   请求帧（stdin，每行一个）:
     {"id":"<本次唯一>","tool":"<工具名>","args":{...}}
     id 每次取没用过的值：同一个 id 只重放旧结果，换了参数再用同一 id 会被拒
@@ -444,7 +444,7 @@ session 模式（读+写必须同进程）:
     要重读后再写。分页读取要翻完全部页才算数（例如 read_param_fields {allRows:true}
     从 rowOffset=0 按 hasMore/nextOffset 翻到 hasMore=false），页会累积、不会互相顶掉。
   最小示例（整段复制到 PowerShell，把两个占位路径换成自己的；每帧一行，读帧在前、写帧在后）:
-    ('{"id":"r-' + [guid]::NewGuid().ToString('N') + '","tool":"read_param_fields","args":{"table":"Bullet","rowIds":[12200404],"fieldIds":["HitBulletID"]}}'),('{"id":"w-' + [guid]::NewGuid().ToString('N') + '","tool":"mutate_param_fields","args":{"edits":[{"table":"Bullet","rowId":12200404,"fieldId":"HitBulletID","value":940}]}}') | node tools/soulforge-cli/sfcli.mjs --workspace "<副本工作区目录>" --base "<游戏根>" session
+    ('{"id":"r-' + [guid]::NewGuid().ToString('N') + '","tool":"read_param_fields","args":{"table":"Bullet","rowIds":[12200404],"fieldIds":["HitBulletID"]}}'),('{"id":"w-' + [guid]::NewGuid().ToString('N') + '","tool":"mutate_param_fields","args":{"edits":[{"table":"Bullet","rowId":12200404,"fieldId":"HitBulletID","value":940}]}}') | node tools/soulforge-cli/sfcli.mjs --workspace "<Mod目录>" --base "<游戏根>" session
 
 选项:
   --workspace <path>           Mod 工作区（必填）
@@ -460,15 +460,15 @@ session 模式（读+写必须同进程）:
   --diagnostics                stderr 输出阶段诊断 JSON Lines
 
 示例:
-  # --workspace 是写入目标：永远指向副本目录，不要指向 <游戏根>/mods。
-  # 写入会落在这个目录里；--base 只用于读取游戏原生数据（压缩字典等），不参与写入。
+  # --workspace 可直接指向 <游戏根>/mods。Patch Engine 自动保存修改前的文件版本，可按操作 ID 回滚。
+  # 只写 --workspace；--base 提供只读的原版资源和压缩库。
   node tools/soulforge-cli/sfcli.mjs \\
-    --workspace "<副本工作区目录>" \\
+    --workspace "<Mod目录>" \\
     --base "<游戏根>" \\
     search-param 落雷 Bullet
 
   node tools/soulforge-cli/sfcli.mjs \\
-    --workspace "<副本工作区目录>" \\
+    --workspace "<Mod目录>" \\
     --base "<游戏根>" \\
     call read_param_fields \\
     '{"table":"Bullet","rowIds":[12200404],"fieldIds":["atkId_Bullet","sfxId_Bullet","HitBulletID"]}'
@@ -573,54 +573,58 @@ async function runCatalogOnly({ command, tool: toolName, registry, json }) {
       note: '原生读取证明只活在产生它的进程里；call 每次是新进程，所以「先 call 读、再 call 写」必然得到 NATIVE_READ_REQUIRED。'
         + '需要读后写时改用 session：一个进程内从 stdin 按行收 {"id","tool","args"} 帧，读帧在前、写帧在后。'
         + '同一对象被写过之后它的读证明即作废（NATIVE_READ_STALE），再写要重读。',
-      sessionExample: `'{"id":"r1","tool":"<读取该目标的工具>","args":{...}}','{"id":"w1","tool":"${tool.name}","args":{...}}' | ${selfInvocation()} --workspace "<副本工作区目录>" session`,
+      sessionExample: `'{"id":"r1","tool":"<读取该目标的工具>","args":{...}}','{"id":"w1","tool":"${tool.name}","args":{...}}' | ${selfInvocation()} --workspace "<Mod目录>" session`,
       seeAlso: '--help 的 session 一节'
     }
   }, null, 2)}\n`);
   process.exit(0);
 }
 
-/**
- * Binding check. Reports whether the two directories look like a safe (workspace copy + game root)
- * pair, or whether a write would land in a real Mod folder. It opens nothing and calls no tool, so
- * it answers even when the Bridge or the compiled packages are unavailable.
- *
- * Safe:    workspace exists, is not the game root or a Mod folder under it, contains no sekiro.exe;
- *          base exists, contains sekiro.exe and oo2core_6_win64.dll.
- * Unsafe:  workspace equals base, is inside base, or holds sekiro.exe.
- */
-async function runPreflight({ workspaceRoot, baseRoot, json }) {
-  const { statSync } = await import('node:fs');
-  const isFile = (path) => { try { return statSync(path).isFile(); } catch { return false; } };
-  const isDir = (path) => { try { return statSync(path).isDirectory(); } catch { return false; } };
-  const normalized = (path) => path.replace(/\\/gu, '/').replace(/\/+$/u, '').toLowerCase();
-  const inside = (child, parent) => child !== parent && child.startsWith(`${parent}/`);
+// A Mod may be inside the game directory, but never use the game's own resource trees as an overlay.
+const SEKIRO_BASE_RESOURCE_DIRS = new Set([
+  'action', 'ai', 'asset', 'chr', 'cutscene', 'event', 'facegen', 'font', 'map', 'menu', 'movie',
+  'msg', 'mtd', 'obj', 'other', 'param', 'parts', 'script', 'sfx', 'shader', 'sound'
+]);
 
+function checkBinding(workspace, base, { requireBase = false, checkBaseMarkers = false } = {}) {
   const findings = [];
-  const workspaceOk = workspaceRoot !== null && isDir(workspaceRoot);
-  const baseOk = baseRoot !== null && isDir(baseRoot);
-  if (!workspaceOk) findings.push({ code: 'WORKSPACE_MISSING', message: `工作区目录不存在：${workspaceRoot ?? '(未提供)'}` });
-  if (!baseOk) findings.push({ code: 'BASE_MISSING', message: `游戏根目录不存在：${baseRoot ?? '(未提供)'}` });
-
-  if (workspaceOk) {
+  const isFile = (path) => { try { return statSync(path).isFile(); } catch { return false; } };
+  const rootOf = (path, code, label) => {
+    try {
+      if (path && statSync(path).isDirectory()) return realpathSync.native(path);
+    } catch { /* Report missing or inaccessible directories without opening the workspace. */ }
+    findings.push({ code, message: `${label}不存在、不是目录或无法解析：${path ?? '(未提供)'}` });
+    return null;
+  };
+  const workspaceRoot = rootOf(workspace, 'WORKSPACE_MISSING', 'Mod 工作区');
+  const baseRoot = base || requireBase ? rootOf(base, 'BASE_MISSING', '游戏根目录') : null;
+  const childOf = (parent, child) => {
+    const rel = relative(parent, child);
+    return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+  };
+  if (workspaceRoot) {
     if (isFile(resolve(workspaceRoot, 'sekiro.exe'))) {
-      findings.push({ code: 'WORKSPACE_IS_GAME_ROOT', message: '工作区里有 sekiro.exe：这是游戏安装根，不是 Mod 副本。写入会落到游戏目录。' });
+      findings.push({ code: 'WORKSPACE_IS_GAME_ROOT', message: '工作区里有 sekiro.exe；请选择 Mod 目录，不要选择游戏安装根。' });
     }
-    const name = workspaceRoot.replace(/\\/gu, '/').split('/').filter(Boolean).pop() ?? '';
-    if (name.toLowerCase() === 'mods') {
-      findings.push({ code: 'WORKSPACE_LOOKS_LIKE_MODS', message: `工作区名为 ${name}：看起来是真实 Mod 目录，不是副本。` });
+    // Also check the nearest install owning this physical directory, even when --base was omitted
+    // or points to a different installation. The overlay name alone is not a path boundary.
+    for (let parent = dirname(workspaceRoot); parent !== dirname(parent); parent = dirname(parent)) {
+      if (!isFile(join(parent, 'sekiro.exe'))) continue;
+      const first = relative(parent, workspaceRoot).split(sep)[0].toLowerCase();
+      if (SEKIRO_BASE_RESOURCE_DIRS.has(first)) {
+        findings.push({ code: 'WORKSPACE_IS_BASE_RESOURCE', message: `工作区在游戏原版资源目录 ${first}/ 中；请选择 Mod 根目录。` });
+      }
+      break;
     }
   }
-  if (workspaceOk && baseOk) {
-    const workspace = normalized(workspaceRoot);
-    const base = normalized(baseRoot);
-    if (workspace === base) {
+  if (workspaceRoot && baseRoot) {
+    if (relative(workspaceRoot, baseRoot) === '') {
       findings.push({ code: 'WORKSPACE_EQUALS_BASE', message: '工作区与游戏根是同一个目录。' });
-    } else if (inside(workspace, base)) {
-      findings.push({ code: 'WORKSPACE_INSIDE_BASE', message: '工作区位于游戏根之内：写入会落到游戏安装目录，不是独立副本。' });
+    } else if (childOf(workspaceRoot, baseRoot)) {
+      findings.push({ code: 'BASE_INSIDE_WORKSPACE', message: '游戏根位于工作区内；请选择较窄的 Mod 目录。' });
     }
   }
-  if (baseOk) {
+  if (checkBaseMarkers && baseRoot) {
     if (!isFile(resolve(baseRoot, 'sekiro.exe'))) {
       findings.push({ code: 'BASE_NOT_GAME_ROOT', message: '游戏根目录里没有 sekiro.exe：--base 指向的可能是 mods，而不是安装根。' });
     }
@@ -629,13 +633,19 @@ async function runPreflight({ workspaceRoot, baseRoot, json }) {
     }
   }
 
+  return { workspaceRoot, baseRoot, findings };
+}
+
+/** Binding check for the Mod overlay and the read-only game root; opens neither a session nor Bridge. */
+function runPreflight({ workspace, base, json, checkBaseMarkers }) {
+  const { workspaceRoot, baseRoot, findings } = checkBinding(workspace, base, { requireBase: true, checkBaseMarkers });
   const ok = findings.length === 0;
   if (json) {
     process.stdout.write(`${JSON.stringify({ ok, workspace: workspaceRoot, base: baseRoot, findings }, null, 2)}\n`);
   } else {
     process.stdout.write(ok
-      ? `preflight ok：工作区是独立目录，游戏根可用于原版读取。\n  workspace=${workspaceRoot}\n  base=${baseRoot}\n`
-      : `preflight 发现问题（写入前请先处理）：\n${findings.map((finding) => `  - [${finding.code}] ${finding.message}`).join('\n')}\n`);
+      ? `preflight ok：已确认 Mod 工作区与只读游戏根。\n  workspace=${workspaceRoot}\n  base=${baseRoot}\n`
+      : `preflight 发现问题：\n${findings.map((finding) => `  - [${finding.code}] ${finding.message}`).join('\n')}\n`);
   }
   process.exit(ok ? 0 : 2);
 }
@@ -644,6 +654,11 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.command === 'help') {
     printUsage();
+    return;
+  }
+
+  if (options.command === 'preflight') {
+    runPreflight({ workspace: abs(options.workspace), base: abs(options.base), json: options.json, checkBaseMarkers: options.game === 'sekiro' });
     return;
   }
 
@@ -674,16 +689,6 @@ async function main() {
     ? projectSessionTransactionFrame(transaction)
     : transaction);
 
-  if (options.command === 'preflight') {
-    // A binding check the caller can run before writing anything. It does not open a workspace or
-    // touch the Bridge, so it works even when the rest is broken. It cannot forbid a write on its
-    // own — the workspace session deliberately allows a Mod folder inside the game install to be
-    // writable — so it reports a verdict and lets the caller decide. It also runs before the
-    // "workspace must exist" gate so it can explain *why* a directory is wrong.
-    await runPreflight({ workspaceRoot: abs(options.workspace), baseRoot: abs(options.base), json: options.json });
-    return;
-  }
-
   // The tool catalog does not depend on a workspace: names, permissions, descriptions and input
   // schemas are static. Requiring --workspace here made a caller pay a full scan just to see what
   // the tool surface is, and made the catalog unavailable while the binding was still being fixed.
@@ -696,10 +701,14 @@ async function main() {
   }
 
   if (!options.workspace) fail('必须通过 --workspace 指定 Mod 工作区路径');
-  const workspaceRoot = abs(options.workspace);
-  const baseRoot = abs(options.base);
-  if (!existsSync(workspaceRoot)) fail(`工作区不存在: ${workspaceRoot}`);
-  if (baseRoot && !existsSync(baseRoot)) fail(`--base 路径不存在: ${baseRoot}`);
+  const { workspaceRoot, baseRoot, findings } = checkBinding(abs(options.workspace), abs(options.base), {
+    checkBaseMarkers: options.game === 'sekiro'
+  });
+  if (findings.length) fail(findings.map(({ code, message }) => `[${code}] ${message}`).join('\n'), 2);
+
+  // Headless reads options directly instead of the roots passed to openLocalCliSession below.
+  options.workspace = workspaceRoot;
+  options.base = baseRoot;
 
   if (options.command === 'agent') {
     // Loaded here, not at the top: `agent exec` is the only command that needs the bundled
