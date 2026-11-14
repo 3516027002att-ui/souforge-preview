@@ -37,7 +37,6 @@ Copy-Item binding.template.md binding.md
 
 - 只支持 Windows x64 与《只狼》Sekiro 1.6.x。
 - 读正确性以 `compare/run.mjs` 与成熟参考工具的比对为准：FMG/TAE/EMEVD/MSB/TPF/GPARAM 已比对；
-  PARAM 有 7 张表因参考工具缺定义而未比对。
 - 写入只在工作区副本内验证过；不写进游戏目录。
 - 本包默认**不含**内置 Agent 运行时（`agent exec` 不可用）；工具类命令（`list`/`describe`/
   `call`/`session`/`preflight`）全部可用。
