@@ -90,6 +90,11 @@ if (-not (Test-Path -LiteralPath 'binding.md')) {
 - 本包默认**不含**内置 Agent 运行时（`agent exec` 不可用）；工具类命令（`list`/`describe`/
   `call`/`session`/`preflight`）全部可用。
 
+## 反馈问题
+
+如果安装说明和实际行为不符，或使用中遇到 SoulForge 工具故障，请到 [Issues](https://github.com/3516027002att-ui/souforge-preview/issues) 报告。
+Agent 会先查重、整理脱敏的复现信息；经你授权后再公开提交。具体见 [Skill 的报告流程](SKILL.md#七报告问题)。
+
 ## 许可证
 
 Apache-2.0，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
